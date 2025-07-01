@@ -31,11 +31,14 @@ Create a fully autonomous turret capable of:
 ## Features (WIP)
 
 - [x] Hardware purchased
+- [ ] Prototype brackets and mounts 3d printed
 - [ ] Dual-camera vision setup
 - [ ] Servo communication + movement test
 - [ ] Depth estimation from stereo input
-- [ ] Path prediction via Kalman filter
+- [ ] Path prediction via kalman filter
 - [ ] Real-time YOLOv8 inference
+- [ ] Final turret housing designed
+- [ ] Turret Housing 3d printed
 - [ ] Multi-step kill logic (detection + motion confirm + depth range)
 - [ ] Fail-safe & safety protocols
 - [ ] Audible status beeps for states (idle, tracking, kill-ready)
