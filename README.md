@@ -49,6 +49,8 @@ Create a fully autonomous turret capable of:
 
 ---
 
+> 🔍 [Read the full project backstory → logs/project-intro.md](logs/project-intro.md)
+
 ## 👤 Author
 
 **Myles**  
