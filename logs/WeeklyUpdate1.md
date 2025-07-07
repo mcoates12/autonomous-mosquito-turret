@@ -1,8 +1,8 @@
 # Weekly Project Update – Week 1
 
-This week’s update will be shorter than most. I’m taking two summer classes and had two exams this week, so most of my time went into studying, recovering from an illness, and the holiday. Still, I’m happy with the progress I made over the last few days.
+This week’s update will be shorter than most. I’m taking two summer classes and had two exams this week, so most of my time this week went into studying, recovering from an illness, and the holiday. Still, I’m happy with the progress I made over the last few days.
 
-I bought a SolidWorks 2025 student license a few months ago, and a buddy of mine let me borrow his Ender-3 Pro printer. I spent most of the week experimenting with printing and learning how the software and hardware work together.
+I bought a SolidWorks 2025 student license a few months ago, and a buddy of mine let me borrow his Ender-3 Pro printer. I spent most of the Friday, Saturday, and today experimenting with printing and learning how the software and hardware work together.
 
 ---
 
