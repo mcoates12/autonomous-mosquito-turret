@@ -23,7 +23,7 @@ Create a fully autonomous turret capable of:
 | 2x AR0234 Cameras| Global shutter cameras for synchronized stereo input  |
 | 16mm Lenses      | Narrow FOV for long-range detection accuracy          |
 | Dynamixel XL430  | Precision pan/tilt control with speed + torque        |
-| YOLOv8n          | Object detection model trained on mosquito imagery    |
+| YOLO          | Object detection model trained on mosquito imagery    |
 | 3D Printed Parts | Custom mounts, housing, and brackets                  |
 
 ---
@@ -31,12 +31,12 @@ Create a fully autonomous turret capable of:
 ## Features (WIP)
 
 - [x] Hardware purchased
-- [ ] Prototype brackets and mounts 3d printed
+- [x] Prototype brackets and mounts 3d printed
 - [ ] Dual-camera vision setup
-- [ ] Servo communication + movement test
+- [x] Servo communication + movement test
 - [ ] Depth estimation from stereo input
 - [ ] Path prediction via kalman filter
-- [ ] Real-time YOLOv8 inference
+- [ ] Real-time AI inference
 - [ ] Final turret housing designed
 - [ ] Turret Housing 3d printed
 - [ ] Multi-step kill logic (detection + motion confirm + depth range)
