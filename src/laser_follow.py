@@ -6,7 +6,7 @@ Requires:
   pip install opencv-python dynamixel-sdk numpy
 
 Run example:
-  python3 laser_follow.py --port /dev/ttyUSB0 --baud 1000000 --cam 0 --width 1920 --height 1200 --v_thresh 60 --s_thresh 40 --deadband_px 20 --lost_frames_hold 1 --max_step_deg 1.0 --pan_dir -1
+  python3 laser_follow.py --port /dev/ttyUSB0 --baud 1000000 --cam 0 --width 1920 --height 1200 --v_thresh 80 --s_thresh 60 --deadband_px 10 --lost_frames_hold 1 --max_step_deg 3.0 --pan_dir -1
 
 Controls:
   q / ESC  : quit (torque off)
@@ -61,7 +61,7 @@ class TurretConfig:
     port: str = "/dev/ttyUSB0"
     baud: int = 1000000
     protocol: float = 2.0
-    profile_velocity: int = 120
+    profile_velocity: int = 200
 
     # Safety: how far a single update is allowed to change angle
     max_step_deg_per_update: float = 2.0
@@ -308,8 +308,8 @@ def main():
 
     # Control tuning:
     # deg_per_px is the main “gain”: how many degrees to move per pixel of error.
-    ap.add_argument("--deg_per_px_pan", type=float, default=0.0040)
-    ap.add_argument("--deg_per_px_tilt", type=float, default=0.0040)
+    ap.add_argument("--deg_per_px_pan", type=float, default=0.0060)
+    ap.add_argument("--deg_per_px_tilt", type=float, default=0.0060)
 
     # Flip directions if motion is opposite your expectation:
     ap.add_argument("--pan_dir", type=int, default=+1, help="Use -1 if pan moves wrong way")
