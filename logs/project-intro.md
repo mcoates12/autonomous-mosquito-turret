@@ -26,18 +26,9 @@ After months of emails, reminder follow-ups, and camping outside professors’ o
 
 It lasted about an hour. Then they told me I wasn’t getting the position due to a lack of experience.
 
-I asked how I was supposed to *get* experience if I couldn’t even get hired. I was told to “learn to code,” “mess around in SolidWorks,” “get your drone pilot’s license,” etc.
+To get this experience I decided to build a self-funded, AI-powered turret that tracks and eliminates mosquitoes in real time.
 
-Afterward, I sat in my car frustrated — hopefully this doesn’t sound entitled — but I didn’t want to just “learn code.” I wanted to do something wild. Something that forced me to grow. Something **undeniable**.
-
-So I decided to build a self-funded, AI-powered turret that tracks and eliminates mosquitoes in real time.
-
-My goal wasn’t just to kill bugs — it was to prove that I could design, build, and document a complete system from scratch. One that combines mechanical design, computer vision, embedded hardware, and AI.
-
-This project doesn’t necessarily align with the drone-focused research group, but it fits where I want to go — toward the defense industry. It’s my answer to every future employer or grad school who asks,  
-> “What have you built?”
-
-Well… here it is.
+My goal Isn’t just to kill bugs — it is to prove that I can design, build, and document a complete system from scratch. One that combines mechanical design, computer vision, embedded hardware, and AI.
 
 ---
 
