@@ -180,7 +180,7 @@ class LiveParams:
     min_area: float = 1.0
     max_area: float = 2000
 
-    # confidence gates (strongly recommended to stop ghost chasing)
+    # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
     area_hi_gate: float = 40.0    # reject huge blobs
 
@@ -403,14 +403,14 @@ class StereoBundle:
         self.P1 = d["P1"]; self.P2 = d["P2"]
         self.Q  = d["Q"]
 
-        # Precomputed rectification maps (nice!)
+        # Precomputed rectification maps
         self.map1_l = d["map1_l"]; self.map2_l = d["map2_l"]
         self.map1_r = d["map1_r"]; self.map2_r = d["map2_r"]
 
         self.image_size = tuple(d["image_size"])  # (w, h)
-        self.square_size = float(d["square_size"])  # your calibration unit
+        self.square_size = float(d["square_size"])  # calibration unit
 
-        # SGBM parameters (starting point)
+        # SGBM parameters
         min_disp = 0
         num_disp = 128  # divisible by 16
         block = 7
@@ -475,7 +475,7 @@ class StereoBundle:
         x1 = max(0, x - half); x2 = min(w, x + half)
         y1 = max(0, y - half); y2 = min(h, y + half)
 
-        # Need a minimum window for SGBM to behave
+        # minimum window for SGBM to behave
         min_w = self.sgbm.getNumDisparities() + 32  # e.g. 160
         if (x2 - x1) < min_w or (y2 - y1) < 80:
             return None, None
@@ -516,7 +516,7 @@ class StereoBundle:
 
         depth_m = float(Z / W)
 
-        # same heuristic you already use
+        # same heuristic already used
         if depth_m > 50.0:
             depth_m /= 1000.0
         if depth_m <= 0 or depth_m > 50:
@@ -563,8 +563,8 @@ class LaserWorker(QtCore.QThread):
         self.roi_fail = 0
         self.full_cooldown = 0
 
-        # tuning knobs (start here)
-        self.DEPTH_EVERY_N = 30          # compute depth every frame (ROI is cheap)
+        # tuning knobs 
+        self.DEPTH_EVERY_N = 30          # compute depth every frame
         self.ROI_SIZE = 320              # ROI window size for fast depth
         self.ROI_PATCH = 5
 
@@ -651,22 +651,21 @@ class LaserWorker(QtCore.QThread):
                     # optional divider line
                     cv2.line(frame, (self.width, 0), (self.width, self.height - 1), (255, 255, 255), 2)
                 elif p.display_mode == "Combined":
-                    # Simple overlay blend (not depth fusion). Good for “both combined” preview.
-                    # If you want anaglyph instead, say so.
+                    # Simple overlay blend. Good for “both combined” preview.
                     frame = cv2.addWeighted(left_rect, 0.5, right_rect, 0.5, 0.0)
                     x_offset = 0
                 else:
                     frame = left_rect
                     x_offset = 0
 
-                # Laser detection on LEFT rectified (you can swap to right if you prefer)
+                # Laser detection on LEFT rectified
                 t0 = time.time()
                 centroid, mask = find_laser_centroid_red(track_img, p)
                 stats.ms_det.append((time.time() - t0) * 1000.0)
 
                 cx0, cy0 = self.width // 2, self.height // 2
                 
-                # DEBUG overlay so you can visually confirm it updates
+                # DEBUG overlay to visually confirm it updates
                 cv2.putText(frame, f"MODE={p.display_mode} TRACK={p.track_source}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
@@ -695,7 +694,7 @@ class LaserWorker(QtCore.QThread):
                     err_x = cx_use - cx0
                     err_y = cy_use - cy0
                     
-                    # lock-on gating (move this ABOVE depth)
+                    # lock-on gating
                     self.lock_count += 1
                     locked = (self.lock_count >= self.LOCK_N)
                     
@@ -705,7 +704,7 @@ class LaserWorker(QtCore.QThread):
                     if self.full_cooldown > 0:
                         self.full_cooldown -= 1
 
-                    # only compute depth every N frames (keeps it controllable)
+                    # only compute depth every N frames
                     self.depth_i = (self.depth_i + 1) % self.DEPTH_EVERY_N
                     do_depth = (self.depth_i == 0)
                     do_depth = do_depth and locked and (p.track_source == "Left")  # only if locked
@@ -838,7 +837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Laser Follow Tuner (live knobs)")
 
-        # Defaults for your setup
+        # Defaults
         self.store = ParamStore()
         self.cam_left = 1
         self.cam_right = 0
