@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
 import os
-from turtle import right
 os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = "/usr/lib/aarch64-linux-gnu/qt5/plugins"
 
 import sys
 import time
 import threading
 from dataclasses import dataclass
+from typing import Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
@@ -18,6 +18,8 @@ from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite  # type: ignore
+
+from tracking_core import EveryNFrames, TargetObservation
 
 # -----------------------------
 # Statistics tracking
@@ -89,9 +91,11 @@ class LatestFrame:
     def __init__(self, cap: cv2.VideoCapture, name: str):
         self.cap = cap
         self.name = name
-        self.lock = threading.Lock()
+        self.condition = threading.Condition()
         self.frame = None
         self.ok = False
+        self.timestamp = 0.0
+        self.sequence = 0
         self.stop_evt = threading.Event()
         self.th = threading.Thread(target=self._run, daemon=True)
 
@@ -100,19 +104,40 @@ class LatestFrame:
 
     def stop(self):
         self.stop_evt.set()
+        with self.condition:
+            self.condition.notify_all()
         self.th.join(timeout=1.0)
 
     def _run(self):
         while not self.stop_evt.is_set():
             ok, f = self.cap.read()
-            with self.lock:
+            captured_at = time.monotonic()
+            with self.condition:
                 self.ok = ok
                 if ok:
+                    # VideoCapture returns a new ndarray. Replacing this
+                    # reference makes snapshots safe to share without copying.
                     self.frame = f
+                    self.timestamp = captured_at
+                    self.sequence += 1
+                self.condition.notify_all()
 
     def get(self):
-        with self.lock:
-            return self.ok, (None if self.frame is None else self.frame.copy())
+        """Return the immutable latest-frame reference without copying pixels."""
+        with self.condition:
+            return (
+                self.ok,
+                self.frame,
+                self.timestamp,
+                self.sequence,
+            )
+
+    def wait_for_new(self, last_sequence: int, timeout: float = 0.05):
+        """Wait briefly for a sequence newer than ``last_sequence``."""
+        with self.condition:
+            if self.sequence == last_sequence and not self.stop_evt.is_set():
+                self.condition.wait(timeout=timeout)
+            return self.ok, self.frame, self.timestamp, self.sequence
 
 # -----------------------------
 # GStreamer pipeline helper
@@ -214,10 +239,26 @@ class ParamStore:
             setattr(self._p, name, value)
 
 
+class TargetDetector(Protocol):
+    """Interface implemented by the laser detector and a future AI detector."""
+
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        params: LiveParams,
+        frame_timestamp: float,
+    ) -> Tuple[Optional[TargetObservation], np.ndarray]:
+        ...
+
+
 # -----------------------------
 # Red laser detection (HSV)
 # -----------------------------
-def find_laser_centroid_red(frame_bgr, p: LiveParams):
+def find_laser_target_red(
+    frame_bgr: np.ndarray,
+    p: LiveParams,
+    frame_timestamp: Optional[float] = None,
+) -> Tuple[Optional[TargetObservation], np.ndarray]:
     """
     Red-laser dot detection:
     - HSV threshold for red (two hue ranges)
@@ -274,7 +315,31 @@ def find_laser_centroid_red(frame_bgr, p: LiveParams):
         return None, mask
     cx = int(M["m10"] / M["m00"])
     cy = int(M["m01"] / M["m00"])
-    return (cx, cy), mask
+    target = TargetObservation(
+        x=float(cx),
+        y=float(cy),
+        confidence=peak_v / 255.0,
+        timestamp=time.monotonic() if frame_timestamp is None else frame_timestamp,
+        label="red_laser",
+        bbox_xyxy=(float(x), float(y), float(x + w), float(y + h2)),
+    )
+    return target, mask
+
+
+class RedLaserDetector:
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        params: LiveParams,
+        frame_timestamp: float,
+    ) -> Tuple[Optional[TargetObservation], np.ndarray]:
+        return find_laser_target_red(frame_bgr, params, frame_timestamp)
+
+
+def find_laser_centroid_red(frame_bgr, p: LiveParams):
+    """Backward-compatible wrapper for callers that only need a centroid."""
+    target, mask = find_laser_target_red(frame_bgr, p)
+    return (None if target is None else target.centroid), mask
 
 
 # -----------------------------
@@ -403,11 +468,16 @@ class StereoBundle:
         self.P1 = d["P1"]; self.P2 = d["P2"]
         self.Q  = d["Q"]
 
-        # Precomputed rectification maps
-        self.map1_l = d["map1_l"]; self.map2_l = d["map2_l"]
-        self.map1_r = d["map1_r"]; self.map2_r = d["map2_r"]
+        # Convert the saved floating-point maps once at startup. OpenCV's
+        # fixed-point map representation is substantially faster for remap().
+        self.map1_l, self.map2_l = cv2.convertMaps(
+            d["map1_l"], d["map2_l"], cv2.CV_16SC2
+        )
+        self.map1_r, self.map2_r = cv2.convertMaps(
+            d["map1_r"], d["map2_r"], cv2.CV_16SC2
+        )
 
-        self.image_size = tuple(d["image_size"])  # (w, h)
+        self.image_size = tuple(int(v) for v in d["image_size"])  # (w, h)
         self.square_size = float(d["square_size"])  # calibration unit
 
         # SGBM parameters
@@ -429,9 +499,35 @@ class StereoBundle:
         )
 
     def rectify(self, left_bgr, right_bgr):
+        left_size = (left_bgr.shape[1], left_bgr.shape[0])
+        right_size = (right_bgr.shape[1], right_bgr.shape[0])
+        if left_size != self.image_size or right_size != self.image_size:
+            raise ValueError(
+                "Stereo frame size does not match calibration: "
+                f"left={left_size} right={right_size} calibration={self.image_size}"
+            )
         left_r  = cv2.remap(left_bgr,  self.map1_l, self.map2_l, cv2.INTER_LINEAR)
         right_r = cv2.remap(right_bgr, self.map1_r, self.map2_r, cv2.INTER_LINEAR)
         return left_r, right_r
+
+    def rectify_left_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """Map one raw left-camera point into the rectified image cheaply."""
+        point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        rectified = cv2.undistortPoints(
+            point,
+            self.mtx_l,
+            self.dist_l,
+            R=self.R1,
+            P=self.P1,
+        )
+        rx, ry = (float(v) for v in rectified[0, 0])
+        if not np.isfinite(rx) or not np.isfinite(ry):
+            return None
+        px, py = int(round(rx)), int(round(ry))
+        width, height = self.image_size
+        if not (0 <= px < width and 0 <= py < height):
+            return None
+        return px, py
 
     def depth_at(self, left_rect_bgr, right_rect_bgr, x: int, y: int):
         """
@@ -523,15 +619,204 @@ class StereoBundle:
             return None, disp
         return depth_m, disp
 
+
+@dataclass(frozen=True)
+class DepthRequest:
+    left_bgr: np.ndarray
+    right_bgr: np.ndarray
+    target: TargetObservation
+    captured_at_l: float
+    captured_at_r: float
+
+
+@dataclass(frozen=True)
+class DepthResult:
+    source_timestamp: float
+    depth_m: Optional[float] = None
+    note: str = ""
+    rect_ms: float = 0.0
+    roi_ms: float = 0.0
+    full_ms: float = 0.0
+    roi_attempted: bool = False
+    roi_ok: bool = False
+    full_attempted: bool = False
+    full_ok: bool = False
+
+
+@dataclass(frozen=True)
+class PreviewFrame:
+    frame_bgr: np.ndarray
+    mask: np.ndarray
+    status: str
+
+
+class StereoDepthWorker:
+    """Run bounded, latest-only stereo work away from the control loop."""
+
+    def __init__(
+        self,
+        stereo: StereoBundle,
+        roi_size: int,
+        roi_patch: int,
+        roi_fail_to_full: int,
+        full_cooldown_sec: float,
+        max_stereo_skew_sec: float,
+    ):
+        self.stereo = stereo
+        self.roi_size = roi_size
+        self.roi_patch = roi_patch
+        self.roi_fail_to_full = roi_fail_to_full
+        self.full_cooldown_sec = full_cooldown_sec
+        self.max_stereo_skew_sec = max_stereo_skew_sec
+
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = False
+        self._busy = False
+        self._pending = None
+        self._latest_result = None
+        self._roi_fail = 0
+        self._next_full_allowed_at = 0.0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="stereo-depth",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop = True
+            self._pending = None
+        self._wake.set()
+        self._thread.join(timeout=2.0)
+
+    def submit(self, request: DepthRequest) -> bool:
+        """Accept work only when idle so depth can never build a backlog."""
+        with self._lock:
+            if self._stop or self._busy or self._pending is not None:
+                return False
+            self._pending = request
+        self._wake.set()
+        return True
+
+    def take_result(self) -> Optional[DepthResult]:
+        with self._lock:
+            result = self._latest_result
+            self._latest_result = None
+        return result
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                if self._stop:
+                    return
+                request = self._pending
+                self._pending = None
+                self._busy = request is not None
+                self._wake.clear()
+
+            if request is None:
+                continue
+
+            result = self._process(request)
+            with self._lock:
+                self._latest_result = result
+                self._busy = False
+
+    def _process(self, request: DepthRequest) -> DepthResult:
+        source_timestamp = request.target.timestamp
+        stereo_skew = abs(request.captured_at_l - request.captured_at_r)
+        if stereo_skew > self.max_stereo_skew_sec:
+            return DepthResult(
+                source_timestamp=source_timestamp,
+                note=f"pair skew={stereo_skew * 1000.0:.0f}ms",
+            )
+
+        try:
+            t0 = time.perf_counter()
+            left_depth, right_depth = self.stereo.rectify(
+                request.left_bgr, request.right_bgr
+            )
+            rect_ms = (time.perf_counter() - t0) * 1000.0
+
+            depth_point = self.stereo.rectify_left_point(
+                request.target.x, request.target.y
+            )
+            if depth_point is None:
+                self._roi_fail += 1
+                return DepthResult(
+                    source_timestamp=source_timestamp,
+                    note="target outside rectified image",
+                    rect_ms=rect_ms,
+                )
+
+            depth_x, depth_y = depth_point
+            t0 = time.perf_counter()
+            depth_m, _ = self.stereo.depth_at_roi(
+                left_depth,
+                right_depth,
+                depth_x,
+                depth_y,
+                roi=self.roi_size,
+                patch=self.roi_patch,
+            )
+            roi_ms = (time.perf_counter() - t0) * 1000.0
+            roi_ok = depth_m is not None
+
+            if roi_ok:
+                self._roi_fail = 0
+            else:
+                self._roi_fail += 1
+
+            full_attempted = False
+            full_ok = False
+            full_ms = 0.0
+            now = time.monotonic()
+            if (depth_m is None and
+                self._roi_fail >= self.roi_fail_to_full and
+                now >= self._next_full_allowed_at):
+                full_attempted = True
+                t0 = time.perf_counter()
+                depth_m, _ = self.stereo.depth_at(
+                    left_depth, right_depth, depth_x, depth_y
+                )
+                full_ms = (time.perf_counter() - t0) * 1000.0
+                full_ok = depth_m is not None
+                self._roi_fail = 0
+                self._next_full_allowed_at = now + self.full_cooldown_sec
+
+            note = "" if depth_m is not None else "stereo depth unavailable"
+            return DepthResult(
+                source_timestamp=source_timestamp,
+                depth_m=depth_m,
+                note=note,
+                rect_ms=rect_ms,
+                roi_ms=roi_ms,
+                full_ms=full_ms,
+                roi_attempted=True,
+                roi_ok=roi_ok,
+                full_attempted=full_attempted,
+                full_ok=full_ok,
+            )
+        except Exception as exc:
+            return DepthResult(
+                source_timestamp=source_timestamp,
+                note=f"depth error: {exc}",
+            )
+
 # -----------------------------
 # Worker thread: capture frames, optionally track & drive servos
 # -----------------------------
 class LaserWorker(QtCore.QThread):
-    frame_ready = QtCore.pyqtSignal(np.ndarray, np.ndarray, str)  # frame_bgr, mask, status text
     error_signal = QtCore.pyqtSignal(str)
 
     def __init__(self, store: ParamStore, cam_left: int, cam_right: int, width: int, height: int,
-             port: str, baud: int, pan_id: int, tilt_id: int, calib_path: str):
+             port: str, baud: int, pan_id: int, tilt_id: int, calib_path: str,
+             detector: Optional[TargetDetector] = None):
         super().__init__()
         self.store = store
         self.cam_left = cam_left
@@ -548,6 +833,14 @@ class LaserWorker(QtCore.QThread):
         self.tilt_id = tilt_id
         self._stop = threading.Event()
         self.turret = None
+        self.detector = detector if detector is not None else RedLaserDetector()
+        self._last_track_sequence = {"Left": 0, "Right": 0}
+
+        # Preview delivery is a latest-only, demand-driven side channel. A
+        # headless caller that never requests a preview pays no composition cost.
+        self._preview_lock = threading.Lock()
+        self._preview_requested = False
+        self._latest_preview = None
 
 
         # centroid smoothing (EMA)
@@ -558,22 +851,68 @@ class LaserWorker(QtCore.QThread):
         # lock-on gating
         self.lock_count = 0
         self.LOCK_N = 1
-        #depth
-        self.depth_i = 0
-        self.roi_fail = 0
-        self.full_cooldown = 0
+        # Depth runs much more slowly than detection/control. It consumes a
+        # model-neutral TargetObservation, so a future AI detector can use the
+        # same rectification and depth path.
+        self.DEPTH_EVERY_N = 30
+        self.depth_cadence = EveryNFrames(self.DEPTH_EVERY_N)
+        self.depth_worker = None
+        self.last_depth_m = None
+        self.last_depth_at = 0.0
+        self.last_depth_note = ""
 
-        # tuning knobs 
-        self.DEPTH_EVERY_N = 30          # compute depth every frame
+        # Depth tuning
         self.ROI_SIZE = 320              # ROI window size for fast depth
         self.ROI_PATCH = 5
 
         self.ROI_FAIL_TO_FULL = 10       # after N ROI failures in a row -> full depth once
-        self.FULL_COOLDOWN_FRAMES = 90   # prevent full depth spamming (~1.5s at 30Hz)
+        self.FULL_COOLDOWN_SEC = 1.5
+        self.DEPTH_STALE_SEC = 2.0
+        self.MAX_STEREO_SKEW_SEC = 0.020
         
         
     def stop(self):
         self._stop.set()
+
+    def request_preview(self) -> None:
+        with self._preview_lock:
+            self._preview_requested = True
+
+    def take_preview(self) -> Optional[PreviewFrame]:
+        with self._preview_lock:
+            preview = self._latest_preview
+            self._latest_preview = None
+        return preview
+
+    def _consume_preview_request(self) -> bool:
+        with self._preview_lock:
+            requested = self._preview_requested
+            self._preview_requested = False
+        return requested
+
+    def _publish_preview(self, frame_bgr: np.ndarray, mask: np.ndarray, status: str) -> None:
+        with self._preview_lock:
+            self._latest_preview = PreviewFrame(frame_bgr, mask, status)
+
+    def _compose_preview_frame(self, left: np.ndarray, right: np.ndarray, p: LiveParams):
+        if p.display_mode == "Left":
+            return left.copy(), 0
+        if p.display_mode == "Right":
+            return right.copy(), 0
+        if p.display_mode == "Side-by-side":
+            frame = np.hstack([left, right])
+            cv2.line(
+                frame,
+                (self.width, 0),
+                (self.width, self.height - 1),
+                (255, 255, 255),
+                2,
+            )
+            x_offset = 0 if p.track_source == "Left" else self.width
+            return frame, x_offset
+        if p.display_mode == "Combined":
+            return cv2.addWeighted(left, 0.5, right, 0.5, 0.0), 0
+        return left.copy(), 0
 
     def run(self):
         try:
@@ -601,6 +940,15 @@ class LaserWorker(QtCore.QThread):
                 
             # Load stereo calibration + build rectify maps + SGBM
             self.stereo = StereoBundle(self.calib_path)
+            self.depth_worker = StereoDepthWorker(
+                stereo=self.stereo,
+                roi_size=self.ROI_SIZE,
+                roi_patch=self.ROI_PATCH,
+                roi_fail_to_full=self.ROI_FAIL_TO_FULL,
+                full_cooldown_sec=self.FULL_COOLDOWN_SEC,
+                max_stereo_skew_sec=self.MAX_STEREO_SKEW_SEC,
+            )
+            self.depth_worker.start()
 
             self.turret = DynamixelPanTilt(self.port, self.baud, self.pan_id, self.tilt_id)
             self.turret.open()
@@ -621,65 +969,73 @@ class LaserWorker(QtCore.QThread):
                 t_loop0 = time.time()
                 p = self.store.get()
 
+                depth_result = self.depth_worker.take_result()
+                if depth_result is not None:
+                    self.last_depth_note = depth_result.note
+                    if depth_result.rect_ms > 0.0:
+                        stats.ms_rect.append(depth_result.rect_ms)
+                    if depth_result.roi_attempted:
+                        stats.depth_roi_calls += 1
+                        stats.ms_depth_roi.append(depth_result.roi_ms)
+                        if depth_result.roi_ok:
+                            stats.depth_roi_ok += 1
+                        else:
+                            stats.depth_roi_fail += 1
+                    if depth_result.full_attempted:
+                        stats.depth_full_calls += 1
+                        stats.ms_depth_full.append(depth_result.full_ms)
+                        if depth_result.full_ok:
+                            stats.depth_full_ok += 1
+                        else:
+                            stats.depth_full_fail += 1
+                    if depth_result.depth_m is not None:
+                        self.last_depth_m = depth_result.depth_m
+                        self.last_depth_at = depth_result.source_timestamp
+                    elif depth_result.note.startswith("depth error:"):
+                        logger.warning(depth_result.note)
+
                 t0 = time.time()
-                okL, left = self.readerL.get()
-                okR, right = self.readerR.get()
+                if p.track_source == "Left":
+                    okL, left, captured_at_l, sequence_l = self.readerL.wait_for_new(
+                        self._last_track_sequence["Left"]
+                    )
+                    okR, right, captured_at_r, sequence_r = self.readerR.get()
+                    track_sequence = sequence_l
+                else:
+                    okR, right, captured_at_r, sequence_r = self.readerR.wait_for_new(
+                        self._last_track_sequence["Right"]
+                    )
+                    okL, left, captured_at_l, sequence_l = self.readerL.get()
+                    track_sequence = sequence_r
                 if left is None or right is None:
                     continue
 
                 stats.ms_cap.append((time.time() - t0) * 1000.0)
                 if not okL or not okR:
                     raise RuntimeError("Camera read failed (left or right).")
+                if track_sequence == self._last_track_sequence[p.track_source]:
+                    continue
+                self._last_track_sequence[p.track_source] = track_sequence
 
+                # Detection and control stay on raw frames. Full-frame stereo
+                # rectification happens only on scheduled depth updates.
+                track_img = left if p.track_source == "Left" else right
+                track_timestamp = captured_at_l if p.track_source == "Left" else captured_at_r
+
+                # Detector output is model-neutral. A future AI detector only
+                # needs to implement TargetDetector.detect().
                 t0 = time.time()
-                left_rect, right_rect = left, right #previously self.stereo.rectify(left, right)
-                stats.ms_rect.append((time.time() - t0) * 1000.0)
-
-                # Pick which image to track on
-                track_img = left_rect if p.track_source == "Left" else right_rect
-
-                # Build what to DISPLAY
-                if p.display_mode == "Left":
-                    frame = left_rect
-                    x_offset = 0
-                elif p.display_mode == "Right":
-                    frame = right_rect
-                    x_offset = 0
-                elif p.display_mode == "Side-by-side":
-                    frame = np.hstack([left_rect, right_rect])
-                    x_offset = 0 if p.track_source == "Left" else self.width
-                    # optional divider line
-                    cv2.line(frame, (self.width, 0), (self.width, self.height - 1), (255, 255, 255), 2)
-                elif p.display_mode == "Combined":
-                    # Simple overlay blend. Good for “both combined” preview.
-                    frame = cv2.addWeighted(left_rect, 0.5, right_rect, 0.5, 0.0)
-                    x_offset = 0
-                else:
-                    frame = left_rect
-                    x_offset = 0
-
-                # Laser detection on LEFT rectified
-                t0 = time.time()
-                centroid, mask = find_laser_centroid_red(track_img, p)
+                target, mask = self.detector.detect(track_img, p, track_timestamp)
                 stats.ms_det.append((time.time() - t0) * 1000.0)
 
                 cx0, cy0 = self.width // 2, self.height // 2
-                
-                # DEBUG overlay to visually confirm it updates
-                cv2.putText(frame, f"MODE={p.display_mode} TRACK={p.track_source}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-
-
-                # draw crosshair
-                cv2.drawMarker(frame, (cx0 + x_offset, cy0), (255, 255, 255),
-                               markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-
-
                 status = ""
+                preview_target = None
+                depth_str = "depth=NA"
                 stats.frames += 1
-                if centroid is not None:
+                if target is not None:
                     stats.found += 1
-                    cx, cy = centroid
+                    cx, cy = target.centroid
 
                     # EMA smoothing
                     if self.cx_f is None:
@@ -690,6 +1046,7 @@ class LaserWorker(QtCore.QThread):
 
                     cx_use = int(round(self.cx_f))
                     cy_use = int(round(self.cy_f))
+                    preview_target = (cx_use, cy_use)
 
                     err_x = cx_use - cx0
                     err_y = cy_use - cy0
@@ -698,56 +1055,32 @@ class LaserWorker(QtCore.QThread):
                     self.lock_count += 1
                     locked = (self.lock_count >= self.LOCK_N)
                     
-                    depth_m = None
-
-                    # cooldown tick
-                    if self.full_cooldown > 0:
-                        self.full_cooldown -= 1
-
-                    # only compute depth every N frames
-                    self.depth_i = (self.depth_i + 1) % self.DEPTH_EVERY_N
-                    do_depth = (self.depth_i == 0)
-                    do_depth = do_depth and locked and (p.track_source == "Left")  # only if locked
+                    depth_eligible = locked and (p.track_source == "Left")
+                    if not depth_eligible:
+                        self.depth_cadence.reset(due_immediately=True)
+                    do_depth = depth_eligible and self.depth_cadence.step()
 
                     if do_depth:
-                        stats.depth_attempt += 1
-                        stats.depth_roi_calls += 1
-                        t0 = time.time()
-                        # FAST PATH: ROI depth
-                        depth_m, _ = self.stereo.depth_at_roi(
-                            left_rect, right_rect, cx_use, cy_use,
-                            roi=self.ROI_SIZE, patch=self.ROI_PATCH,
+                        accepted = self.depth_worker.submit(
+                            DepthRequest(
+                                left_bgr=left,
+                                right_bgr=right,
+                                target=target,
+                                captured_at_l=captured_at_l,
+                                captured_at_r=captured_at_r,
+                            )
                         )
-                        stats.ms_depth_roi.append((time.time() - t0) * 1000.0)
-                    if depth_m is None:
-                        self.roi_fail += 1
-                        stats.depth_roi_fail += 1
-                    else:
-                        self.roi_fail = 0
-                        stats.depth_roi_ok += 1
+                        if accepted:
+                            stats.depth_attempt += 1
 
-                    # SLOW PATH: full depth ONCE if ROI keeps failing, with cooldown
-                    if (depth_m is None and
-                        self.roi_fail >= self.ROI_FAIL_TO_FULL and
-                        self.full_cooldown == 0):
-                        
-                        stats.depth_full_calls += 1
-                        t0 = time.time()
-                        depth_m, _ = self.stereo.depth_at(left_rect, right_rect, cx_use, cy_use)  # slow
-                        self.full_cooldown = self.FULL_COOLDOWN_FRAMES
-                        self.roi_fail = 0  # reset after escalation
-                        stats.ms_depth_full.append((time.time() - t0) * 1000.0)
-                    
-                    if depth_m is not None:
-                        depth_str = f"depth={depth_m:.2f} m"
+                    depth_age = time.monotonic() - self.last_depth_at
+                    if self.last_depth_m is not None and depth_age <= self.DEPTH_STALE_SEC:
+                        depth_str = f"depth={self.last_depth_m:.2f} m age={depth_age:.1f}s"
+                    elif self.last_depth_note:
+                        depth_str = f"depth=NA ({self.last_depth_note})"
                     else:
                         depth_str = "depth=NA"
 
-                    cv2.putText(frame, depth_str, (10, 70),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-                    status = status + "  " + depth_str
-
-                    
                     # deadband
                     if abs(err_x) < p.deadband_px:
                         err_x = 0
@@ -757,9 +1090,11 @@ class LaserWorker(QtCore.QThread):
                     if locked:
                         stats.locked_frames += 1
 
-                    # show dot
-                    cv2.circle(frame, (cx_use + x_offset, cy_use), 6, (0, 255, 255), 2)
-                    status = f"FOUND  lock={self.lock_count}/{self.LOCK_N}  err=({err_x},{err_y})  pan={self.turret.pan_cmd:.1f} tilt={self.turret.tilt_cmd:.1f}"
+                    status = (
+                        f"FOUND  lock={self.lock_count}/{self.LOCK_N}  "
+                        f"err=({err_x},{err_y})  pan={self.turret.pan_cmd:.1f} "
+                        f"tilt={self.turret.tilt_cmd:.1f}  {depth_str}"
+                    )
 
                     # drive servos only if enabled + tracking enabled + locked + nonzero error
                     if p.tracking_enabled and p.servos_enabled and locked and (err_x != 0 or err_y != 0):
@@ -781,17 +1116,57 @@ class LaserWorker(QtCore.QThread):
                             pass #stops error and keeps torque on
                 else:
                     self.lock_count = 0
+                    self.depth_cadence.reset(due_immediately=True)
                     status = "NOT FOUND"
                     pass #keeps torque on021
 
-                # emit frames (throttled UI)
-                cv2.putText(frame, stats.hud(), (10, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-
-                self.ui_i = getattr(self, "ui_i", 0) + 1
-                UI_EVERY_N = 2  # show ~30 fps UI while backend can run faster
-                if (self.ui_i % UI_EVERY_N) == 0:
-                    self.frame_ready.emit(frame, mask, status)
+                if self._consume_preview_request():
+                    frame, x_offset = self._compose_preview_frame(left, right, p)
+                    cv2.putText(
+                        frame,
+                        f"MODE={p.display_mode} TRACK={p.track_source}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.drawMarker(
+                        frame,
+                        (cx0 + x_offset, cy0),
+                        (255, 255, 255),
+                        markerType=cv2.MARKER_CROSS,
+                        markerSize=18,
+                        thickness=2,
+                    )
+                    if preview_target is not None:
+                        preview_x, preview_y = preview_target
+                        cv2.circle(
+                            frame,
+                            (preview_x + x_offset, preview_y),
+                            6,
+                            (0, 255, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            frame,
+                            depth_str,
+                            (10, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9,
+                            (255, 255, 255),
+                            2,
+                        )
+                    cv2.putText(
+                        frame,
+                        stats.hud(),
+                        (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+                    self._publish_preview(frame, mask, status)
                 stats.ms_loop.append((time.time() - t_loop0) * 1000.0)
                 stats.log_once_per_sec(logger)
 
@@ -806,6 +1181,12 @@ class LaserWorker(QtCore.QThread):
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
+            # Stop background stereo work before tearing down shared state.
+            try:
+                if self.depth_worker is not None:
+                    self.depth_worker.stop()
+            except Exception:
+                pass
             # stop camera threads first
             try:
                 if hasattr(self, "readerL"):
@@ -833,6 +1214,8 @@ class LaserWorker(QtCore.QThread):
 # GUI
 # -----------------------------
 class MainWindow(QtWidgets.QMainWindow):
+    PREVIEW_FPS = 30
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Laser Follow Tuner (live knobs)")
@@ -850,12 +1233,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tilt_id = 2
 
         self.worker = None
+        self.preview_timer = QtCore.QTimer(self)
+        self.preview_timer.setInterval(max(1, round(1000 / self.PREVIEW_FPS)))
+        self.preview_timer.timeout.connect(self.poll_preview)
 
         self._build_ui()
         self._apply_tooltips()
 
         # start camera preview worker immediately (servos stay off until Start)
         self.start_worker()
+        self.preview_timer.start()
 
     def _build_ui(self):
         root = QtWidgets.QWidget()
@@ -1048,9 +1435,9 @@ class MainWindow(QtWidgets.QMainWindow):
             tilt_id=self.tilt_id,
             calib_path=self.calib_path
         )
-        self.worker.frame_ready.connect(self.on_frame)
         self.worker.error_signal.connect(self.on_error)
         self.worker.start()
+        self.worker.request_preview()
 
     def on_start_tracking(self):
         self.store.set_attr("tracking_enabled", True)
@@ -1062,7 +1449,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store.set_attr("servos_enabled", bool(self.chk_servos.isChecked()))
 
     def on_error(self, msg: str):
+        self.preview_timer.stop()
         self.lbl_status.setText(f"ERROR: {msg}")
+
+    def poll_preview(self):
+        if self.worker is None:
+            return
+        preview = self.worker.take_preview()
+        self.worker.request_preview()
+        if preview is not None:
+            self.on_frame(preview.frame_bgr, preview.mask, preview.status)
 
     def on_frame(self, frame_bgr: np.ndarray, mask: np.ndarray, status: str):
         self.lbl_status.setText(f"Status: {status}")
@@ -1091,6 +1487,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         # stop tracking first
+        self.preview_timer.stop()
         self.store.set_attr("tracking_enabled", False)
         try:
             if self.worker is not None:
