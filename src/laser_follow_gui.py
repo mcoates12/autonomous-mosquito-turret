@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
 import os
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = "/usr/lib/aarch64-linux-gnu/qt5/plugins"
+from pathlib import Path
+
+JETSON_QT_PLUGIN_PATH = "/usr/lib/aarch64-linux-gnu/qt5/plugins"
+if os.path.isdir(JETSON_QT_PLUGIN_PATH):
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", JETSON_QT_PLUGIN_PATH)
 
 import sys
 import time
@@ -17,17 +21,16 @@ from collections import deque
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite  # type: ignore
-
-from tracking_core import EveryNFrames, TargetObservation
+from pan_tilt_control import DynamixelPanTilt, FixedRatePanTiltController
+from tracking_core import ControlTarget, EveryNFrames, TargetObservation
 
 # -----------------------------
 # Statistics tracking
 # -----------------------------
 class Stats:
     def __init__(self):
-        self.t0 = time.time()
-        self.last_log = time.time()
+        self.t0 = time.monotonic()
+        self.last_log = time.monotonic()
 
         # counts
         self.frames = 0
@@ -58,14 +61,14 @@ class Stats:
 
     def hud(self):
         # quick one-liner for overlay
-        return (f"FPS~{self.frames/max(1e-6,(time.time()-self.t0)):.1f} "
+        return (f"FPS~{self.frames/max(1e-6,(time.monotonic()-self.t0)):.1f} "
                 f"found={self.found}/{self.frames} "
                 f"ROI ok={self.depth_roi_ok}/{self.depth_roi_calls} "
                 f"FULL={self.depth_full_calls} "
                 f"lock={self.locked_frames} move={self.move_frames}")
 
     def log_once_per_sec(self, logger):
-        now = time.time()
+        now = time.monotonic()
         if now - self.last_log < 1.0:
             return
         self.last_log = now
@@ -159,39 +162,6 @@ def gst_v4l2_bgr_pipeline(device: str, width: int, height: int, fps: int = 60) -
     )
 
 # -----------------------------
-# Dynamixel XL430 Control Table (Protocol 2.0)
-# -----------------------------
-ADDR_OPERATING_MODE   = 11
-ADDR_TORQUE_ENABLE    = 64
-ADDR_PROFILE_VELOCITY = 112
-ADDR_GOAL_POSITION    = 116
-
-LEN_GOAL_POSITION     = 4
-
-OPERATING_MODE_POSITION = 3
-TORQUE_ON, TORQUE_OFF = 1, 0
-
-TICKS_PER_REV = 4096.0
-DEG_PER_TICK = 360.0 / TICKS_PER_REV
-
-
-# -----------------------------
-# Utility
-# -----------------------------
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def wrap_deg_0_360(deg: float) -> float:
-    d = deg % 360.0
-    if d < 0:
-        d += 360.0
-    return d
-
-def int_to_le_bytes(value: int, length: int) -> bytes:
-    return int(value).to_bytes(length, byteorder="little", signed=False)
-
-
-# -----------------------------
 # Shared live parameters (GUI -> worker)
 # -----------------------------
 @dataclass
@@ -217,6 +187,7 @@ class LiveParams:
     rate_hz: float = 60.0
 
     profile_velocity: int = 200
+    profile_acceleration: int = 30
     pan_dir: int = -1
     tilt_dir: int = 1
 
@@ -265,7 +236,7 @@ def find_laser_target_red(
     - Allows low saturation (important at distance on walls)
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    v = hsv[:, :, 2]
 
     lower1 = np.array([0,   p.s_thresh, p.v_thresh], dtype=np.uint8)
     upper1 = np.array([10,  255,        255],        dtype=np.uint8)
@@ -341,115 +312,6 @@ def find_laser_centroid_red(frame_bgr, p: LiveParams):
     target, mask = find_laser_target_red(frame_bgr, p)
     return (None if target is None else target.centroid), mask
 
-
-# -----------------------------
-# Dynamixel pan/tilt minimal controller
-# -----------------------------
-class DynamixelPanTilt:
-    def __init__(self, port: str, baud: int, pan_id: int, tilt_id: int):
-        self.port = port
-        self.baud = baud
-        self.pan_id = pan_id
-        self.tilt_id = tilt_id
-
-        self.protocol = 2.0
-        self.port_handler = PortHandler(self.port)
-        self.packet_handler = PacketHandler(self.protocol)
-
-        self.sync_write_goal = GroupSyncWrite(
-            self.port_handler, self.packet_handler, ADDR_GOAL_POSITION, LEN_GOAL_POSITION
-        )
-
-        # your safe limits
-        self.pan_min, self.pan_max = 0.0, 360.0
-        self.tilt_min, self.tilt_max = 62.23, 191.78
-        self.pan_cmd = 180.0
-        self.tilt_cmd = 120.0
-
-        self.opened = False
-        self.torque = False
-        self.profile_velocity = 200
-
-    def _check(self, servo_id: int, comm: int, err: int, what: str):
-        if comm != 0:
-            raise RuntimeError(f"[ID:{servo_id}] {what} COMM FAIL: {self.packet_handler.getTxRxResult(comm)}")
-        if err != 0:
-            raise RuntimeError(f"[ID:{servo_id}] {what} DXL ERROR: {self.packet_handler.getRxPacketError(err)}")
-
-    def open(self):
-        if self.opened:
-            return
-        if not self.port_handler.openPort():
-            raise RuntimeError(f"Failed to open port {self.port}")
-        if not self.port_handler.setBaudRate(self.baud):
-            raise RuntimeError(f"Failed to set baudrate {self.baud}")
-        self.opened = True
-
-        # position mode
-        self.torque_off()
-        for sid in (self.pan_id, self.tilt_id):
-            comm, err = self.packet_handler.write1ByteTxRx(self.port_handler, sid, ADDR_OPERATING_MODE, OPERATING_MODE_POSITION)
-            self._check(sid, comm, err, "set operating mode")
-
-    def close(self):
-        try:
-            self.torque_off()
-        except Exception:
-            pass
-        try:
-            if self.opened:
-                self.port_handler.closePort()
-        finally:
-            self.opened = False
-
-    def set_profile_velocity(self, vel: int):
-        self.profile_velocity = int(vel)
-        for sid in (self.pan_id, self.tilt_id):
-            comm, err = self.packet_handler.write4ByteTxRx(self.port_handler, sid, ADDR_PROFILE_VELOCITY, int(vel))
-            self._check(sid, comm, err, "set profile velocity")
-
-    def torque_on(self):
-        for sid in (self.pan_id, self.tilt_id):
-            comm, err = self.packet_handler.write1ByteTxRx(self.port_handler, sid, ADDR_TORQUE_ENABLE, TORQUE_ON)
-            self._check(sid, comm, err, "torque on")
-        self.torque = True
-
-    def torque_off(self):
-        for sid in (self.pan_id, self.tilt_id):
-            try:
-                comm, err = self.packet_handler.write1ByteTxRx(self.port_handler, sid, ADDR_TORQUE_ENABLE, TORQUE_OFF)
-                self._check(sid, comm, err, "torque off")
-            except Exception:
-                pass
-        self.torque = False
-
-    def _deg_to_ticks(self, deg: float) -> int:
-        d = wrap_deg_0_360(deg)
-        return int(round(d / DEG_PER_TICK)) % int(TICKS_PER_REV)
-
-    def send(self, pan_deg: float, tilt_deg: float, max_step_deg: float):
-        pan_deg = clamp(pan_deg, self.pan_min, self.pan_max)
-        tilt_deg = clamp(tilt_deg, self.tilt_min, self.tilt_max)
-
-        # per-update clamp to reduce jerk
-        pan_deg = clamp(pan_deg, self.pan_cmd - max_step_deg, self.pan_cmd + max_step_deg)
-        tilt_deg = clamp(tilt_deg, self.tilt_cmd - max_step_deg, self.tilt_cmd + max_step_deg)
-
-        pan_ticks = self._deg_to_ticks(pan_deg)
-        tilt_ticks = self._deg_to_ticks(tilt_deg)
-
-        self.sync_write_goal.clearParam()
-        ok1 = self.sync_write_goal.addParam(self.pan_id, int_to_le_bytes(pan_ticks, 4))
-        ok2 = self.sync_write_goal.addParam(self.tilt_id, int_to_le_bytes(tilt_ticks, 4))
-        if not (ok1 and ok2):
-            raise RuntimeError("Failed to add params to sync write")
-
-        comm = self.sync_write_goal.txPacket()
-        if comm != 0:
-            raise RuntimeError(f"sync_write COMM FAIL: {self.packet_handler.getTxRxResult(comm)}")
-
-        self.pan_cmd = pan_deg
-        self.tilt_cmd = tilt_deg
 
 # -----------------------------
 # stereo capture thread: depth from stereovision
@@ -833,8 +695,10 @@ class LaserWorker(QtCore.QThread):
         self.tilt_id = tilt_id
         self._stop = threading.Event()
         self.turret = None
+        self.controller = None
         self.detector = detector if detector is not None else RedLaserDetector()
         self._last_track_sequence = {"Left": 0, "Right": 0}
+        self._active_track_source = None
 
         # Preview delivery is a latest-only, demand-driven side channel. A
         # headless caller that never requests a preview pays no composition cost.
@@ -850,7 +714,9 @@ class LaserWorker(QtCore.QThread):
 
         # lock-on gating
         self.lock_count = 0
-        self.LOCK_N = 1
+        self.LOCK_N = 3
+        self.miss_count = 0
+        self.MISS_RESET_N = 3
         # Depth runs much more slowly than detection/control. It consumes a
         # model-neutral TargetObservation, so a future AI detector can use the
         # same rectification and depth path.
@@ -916,19 +782,23 @@ class LaserWorker(QtCore.QThread):
 
     def run(self):
         try:
-            pipeL = gst_v4l2_bgr_pipeline("/dev/video1", self.width, self.height, fps=60)
-            pipeR = gst_v4l2_bgr_pipeline("/dev/video0", self.width, self.height, fps=60)
+            pipeL = gst_v4l2_bgr_pipeline(
+                f"/dev/video{self.cam_left}", self.width, self.height, fps=60
+            )
+            pipeR = gst_v4l2_bgr_pipeline(
+                f"/dev/video{self.cam_right}", self.width, self.height, fps=60
+            )
 
             self.capL = cv2.VideoCapture(pipeL, cv2.CAP_GSTREAMER)
             self.capR = cv2.VideoCapture(pipeR, cv2.CAP_GSTREAMER)
             
+            if not self.capL.isOpened() or not self.capR.isOpened():
+                raise RuntimeError("Could not open both cameras (left/right). Check /dev/video* indexes.")
+
             self.readerL = LatestFrame(self.capL, "L")
             self.readerR = LatestFrame(self.capR, "R")
             self.readerL.start()
             self.readerR.start()
-
-            if not self.capL.isOpened() or not self.capR.isOpened():
-                raise RuntimeError("Could not open both cameras (left/right). Check /dev/video* indexes.")
  
             for cap in (self.capL, self.capR):
                # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -952,9 +822,8 @@ class LaserWorker(QtCore.QThread):
 
             self.turret = DynamixelPanTilt(self.port, self.baud, self.pan_id, self.tilt_id)
             self.turret.open()
-            
-            # don’t torque on until user hits Start Tracking
-            last = time.time()
+            self.controller = FixedRatePanTiltController(self.turret, self.store)
+            self.controller.start()
             
             logging.basicConfig(
                 level=logging.INFO,
@@ -964,10 +833,36 @@ class LaserWorker(QtCore.QThread):
             )
             logger = logging.getLogger("turret")
             stats = Stats()
+            logger.info(
+                "configured servo limits pan=%.2f..%.2f deg tilt=%.2f..%.2f deg; "
+                "initial pan=%.2f deg tilt=%.2f deg",
+                self.turret.pan_min,
+                self.turret.pan_max,
+                self.turret.tilt_min,
+                self.turret.tilt_max,
+                self.turret.pan_actual,
+                self.turret.tilt_actual,
+            )
 
             while not self._stop.is_set():
-                t_loop0 = time.time()
+                t_loop0 = time.perf_counter()
                 p = self.store.get()
+
+                if p.track_source != self._active_track_source:
+                    self._active_track_source = p.track_source
+                    self.cx_f = None
+                    self.cy_f = None
+                    self.lock_count = 0
+                    self.miss_count = 0
+                    self.depth_cadence.reset(due_immediately=True)
+                    self.controller.clear_target()
+
+                controller_state = self.controller.snapshot()
+                if controller_state.error is not None:
+                    raise RuntimeError(
+                        f"Servo controller stopped: {controller_state.error}"
+                    )
+                stats.move_frames = controller_state.move_updates
 
                 depth_result = self.depth_worker.take_result()
                 if depth_result is not None:
@@ -994,7 +889,7 @@ class LaserWorker(QtCore.QThread):
                     elif depth_result.note.startswith("depth error:"):
                         logger.warning(depth_result.note)
 
-                t0 = time.time()
+                t0 = time.perf_counter()
                 if p.track_source == "Left":
                     okL, left, captured_at_l, sequence_l = self.readerL.wait_for_new(
                         self._last_track_sequence["Left"]
@@ -1010,7 +905,7 @@ class LaserWorker(QtCore.QThread):
                 if left is None or right is None:
                     continue
 
-                stats.ms_cap.append((time.time() - t0) * 1000.0)
+                stats.ms_cap.append((time.perf_counter() - t0) * 1000.0)
                 if not okL or not okR:
                     raise RuntimeError("Camera read failed (left or right).")
                 if track_sequence == self._last_track_sequence[p.track_source]:
@@ -1024,9 +919,9 @@ class LaserWorker(QtCore.QThread):
 
                 # Detector output is model-neutral. A future AI detector only
                 # needs to implement TargetDetector.detect().
-                t0 = time.time()
+                t0 = time.perf_counter()
                 target, mask = self.detector.detect(track_img, p, track_timestamp)
-                stats.ms_det.append((time.time() - t0) * 1000.0)
+                stats.ms_det.append((time.perf_counter() - t0) * 1000.0)
 
                 cx0, cy0 = self.width // 2, self.height // 2
                 status = ""
@@ -1035,6 +930,7 @@ class LaserWorker(QtCore.QThread):
                 stats.frames += 1
                 if target is not None:
                     stats.found += 1
+                    self.miss_count = 0
                     cx, cy = target.centroid
 
                     # EMA smoothing
@@ -1052,8 +948,17 @@ class LaserWorker(QtCore.QThread):
                     err_y = cy_use - cy0
                     
                     # lock-on gating
-                    self.lock_count += 1
+                    self.lock_count = min(self.LOCK_N, self.lock_count + 1)
                     locked = (self.lock_count >= self.LOCK_N)
+
+                    self.controller.publish_target(
+                        ControlTarget(
+                            error_x_px=float(err_x),
+                            error_y_px=float(err_y),
+                            timestamp=target.timestamp,
+                            locked=locked,
+                        )
+                    )
                     
                     depth_eligible = locked and (p.track_source == "Left")
                     if not depth_eligible:
@@ -1092,33 +997,30 @@ class LaserWorker(QtCore.QThread):
 
                     status = (
                         f"FOUND  lock={self.lock_count}/{self.LOCK_N}  "
-                        f"err=({err_x},{err_y})  pan={self.turret.pan_cmd:.1f} "
-                        f"tilt={self.turret.tilt_cmd:.1f}  {depth_str}"
+                        f"err=({err_x},{err_y})  "
+                        f"torque={'ON' if controller_state.torque_enabled else 'OFF'}  "
+                        f"pan={controller_state.pan_actual_deg:.1f}/"
+                        f"{controller_state.pan_command_deg:.1f} "
+                        f"tilt={controller_state.tilt_actual_deg:.1f}/"
+                        f"{controller_state.tilt_command_deg:.1f} "
+                        f"vel=({controller_state.pan_velocity_deg_s:.1f},"
+                        f"{controller_state.tilt_velocity_deg_s:.1f}) deg/s  "
+                        f"{depth_str}"
                     )
-
-                    # drive servos only if enabled + tracking enabled + locked + nonzero error
-                    if p.tracking_enabled and p.servos_enabled and locked and (err_x != 0 or err_y != 0):
-                        # ensure torque on + profile velocity applied
-                        if not self.turret.torque:
-                            self.turret.set_profile_velocity(p.profile_velocity)
-                            self.turret.torque_on()
-
-                        dpan = p.pan_dir * (p.deg_per_px_pan * err_x)
-                        dtilt = p.tilt_dir * (p.deg_per_px_tilt * err_y)
-
-                        new_pan = self.turret.pan_cmd + dpan
-                        new_tilt = self.turret.tilt_cmd + dtilt
-                        stats.move_frames += 1
-                        self.turret.send(new_pan, new_tilt, p.max_step_deg)
-                    else:
-                        # if either tracking OR servos disabled, keep torque off
-                        if (not p.tracking_enabled or not p.servos_enabled) and self.turret.torque:
-                            pass #stops error and keeps torque on
                 else:
+                    self.controller.clear_target()
                     self.lock_count = 0
+                    self.miss_count += 1
+                    if self.miss_count >= self.MISS_RESET_N:
+                        self.cx_f = None
+                        self.cy_f = None
                     self.depth_cadence.reset(due_immediately=True)
-                    status = "NOT FOUND"
-                    pass #keeps torque on021
+                    status = (
+                        "NOT FOUND  "
+                        f"torque={'ON' if controller_state.torque_enabled else 'OFF'}  "
+                        f"pan={controller_state.pan_actual_deg:.1f} "
+                        f"tilt={controller_state.tilt_actual_deg:.1f}"
+                    )
 
                 if self._consume_preview_request():
                     frame, x_offset = self._compose_preview_frame(left, right, p)
@@ -1167,20 +1069,20 @@ class LaserWorker(QtCore.QThread):
                         2,
                     )
                     self._publish_preview(frame, mask, status)
-                stats.ms_loop.append((time.time() - t_loop0) * 1000.0)
+                stats.ms_loop.append((time.perf_counter() - t_loop0) * 1000.0)
                 stats.log_once_per_sec(logger)
 
-                # rate limit
-                #dt = 1.0 / max(1e-6, p.rate_hz)
-                #now = time.time()
-                #elapsed = now - last
-                #if elapsed < dt:
-                    #time.sleep(dt - elapsed)
-                last = time.time()
-    
+
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
+            # The controller owns the serial bus. Stop it before closing the
+            # port or tearing down the rest of the worker.
+            try:
+                if self.controller is not None:
+                    self.controller.stop()
+            except Exception:
+                pass
             # Stop background stereo work before tearing down shared state.
             try:
                 if self.depth_worker is not None:
@@ -1224,7 +1126,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.store = ParamStore()
         self.cam_left = 1
         self.cam_right = 0
-        self.calib_path = "/home/myles/Documents/autonomous-mosquito-turret/src/stereo_calib/stereo_calibration_full.npz"
+        self.calib_path = str(
+            Path(__file__).resolve().parent
+            / "stereo_calib"
+            / "stereo_calibration_full.npz"
+        )
         self.width = 1920
         self.height = 1200
         self.port = "/dev/ttyUSB0"
@@ -1264,10 +1170,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl.addWidget(QtWidgets.QLabel("Display"))
         ctrl.addWidget(self.cb_display)
 
-        def on_display_changed(t):
-            print("Display changed to:", t)
-            self.store.set_attr("display_mode", t)
-        
         self.cb_track = QtWidgets.QComboBox()
         self.cb_track.addItems(["Left", "Right"])
         ctrl.addWidget(QtWidgets.QLabel("Track source"))
@@ -1323,7 +1225,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_deadband = integer(0, 200, p.deadband_px)
         self.sb_rate = dbl(5.0, 120.0, 1.0, p.rate_hz)
 
-        self.sb_profile_vel = integer(0, 1500, p.profile_velocity)
+        self.sb_profile_vel = integer(2, 1500, p.profile_velocity)
+        self.sb_profile_accel = integer(1, 750, p.profile_acceleration)
 
         self.sb_v = integer(0, 255, p.v_thresh)
         self.sb_s = integer(0, 255, p.s_thresh)
@@ -1346,6 +1249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("deadband_px", self.sb_deadband)
         form.addRow("rate_hz", self.sb_rate)
         form.addRow("profile_velocity", self.sb_profile_vel)
+        form.addRow("profile_acceleration", self.sb_profile_accel)
         form.addRow("pan_dir", self.cb_pan_dir)
         form.addRow("tilt_dir", self.cb_tilt_dir)
 
@@ -1386,6 +1290,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_deadband.valueChanged.connect(lambda v: self.store.set_attr("deadband_px", int(v)))
         self.sb_rate.valueChanged.connect(lambda v: self.store.set_attr("rate_hz", float(v)))
         self.sb_profile_vel.valueChanged.connect(lambda v: self.store.set_attr("profile_velocity", int(v)))
+        self.sb_profile_accel.valueChanged.connect(
+            lambda v: self.store.set_attr("profile_acceleration", int(v))
+        )
 
         self.sb_v.valueChanged.connect(lambda v: self.store.set_attr("v_thresh", int(v)))
         self.sb_s.valueChanged.connect(lambda v: self.store.set_attr("s_thresh", int(v)))
@@ -1401,10 +1308,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_tooltips(self):
         self.sb_deg_pan.setToolTip("Degrees moved per pixel of horizontal error. Higher = faster/more aggressive, but can overshoot/jitter.")
         self.sb_deg_tilt.setToolTip("Degrees moved per pixel of vertical error. Higher = faster/more aggressive, but can overshoot/jitter.")
-        self.sb_max_step.setToolTip("Max degrees the command is allowed to change per update. Caps snap/jerk. Lower = smoother/safer.")
+        self.sb_max_step.setToolTip("Maximum command change at the 60 Hz reference rate. It is time-scaled when rate_hz changes. Lower = smoother/safer.")
         self.sb_deadband.setToolTip("If error magnitude is below this many pixels, treat it as zero (no movement). Bigger = less jitter near center.")
-        self.sb_rate.setToolTip("Update loop rate in Hz. Higher = more responsive but can amplify jitter/buzz. 20–60 typical.")
+        self.sb_rate.setToolTip("Fixed servo controller rate in Hz. It is independent of camera and detector FPS; 60 Hz is the recommended starting point.")
         self.sb_profile_vel.setToolTip("Dynamixel Profile Velocity. Higher = servo can physically move faster. Too high can sound/feel harsh.")
+        self.sb_profile_accel.setToolTip(
+            "Dynamixel Profile Acceleration. Lower values ramp speed more gently. "
+            "It is automatically capped at half of Profile Velocity."
+        )
         self.cb_pan_dir.setToolTip("Flip pan direction if it moves the wrong way (+1 or -1).")
         self.cb_tilt_dir.setToolTip("Flip tilt direction if it moves the wrong way (+1 or -1).")
 
@@ -1419,6 +1330,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_servos.setToolTip("If unchecked, tracking can run and display, but servos will never move.")
         self.btn_start.setToolTip("Enable tracking & torque on (servos will follow dot).")
         self.btn_stop.setToolTip("Disable tracking and torque off (GUI + camera stay running).")
+        self.lbl_status.setToolTip(
+            "Pan and tilt are shown as actual/commanded degrees; velocity is measured servo feedback."
+        )
 
     def start_worker(self):
         if self.worker is not None:
