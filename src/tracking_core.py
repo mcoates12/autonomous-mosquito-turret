@@ -36,6 +36,95 @@ class ControlTarget:
     locked: bool
 
 
+@dataclass(frozen=True)
+class FilteredPoint:
+    accepted: bool
+    outlier: bool
+    x: float
+    y: float
+    locked: bool
+
+
+class TimeBasedTargetFilter:
+    """Frame-rate-independent point smoothing, validation, and lock timing."""
+
+    def __init__(
+        self,
+        smoothing_tau_sec: float = 0.06,
+        lock_time_sec: float = 0.05,
+        reset_after_sec: float = 0.15,
+        max_speed_px_sec: float = 8000.0,
+        jump_allowance_px: float = 40.0,
+    ):
+        self.smoothing_tau_sec = max(1e-6, float(smoothing_tau_sec))
+        self.lock_time_sec = max(0.0, float(lock_time_sec))
+        self.reset_after_sec = max(0.0, float(reset_after_sec))
+        self.max_speed_px_sec = max(0.0, float(max_speed_px_sec))
+        self.jump_allowance_px = max(0.0, float(jump_allowance_px))
+        self.reset()
+
+    def configure(
+        self,
+        smoothing_tau_sec: float,
+        lock_time_sec: float,
+        max_speed_px_sec: float,
+    ) -> None:
+        self.smoothing_tau_sec = max(1e-6, float(smoothing_tau_sec))
+        self.lock_time_sec = max(0.0, float(lock_time_sec))
+        self.max_speed_px_sec = max(0.0, float(max_speed_px_sec))
+
+    def reset(self) -> None:
+        self._x = None
+        self._y = None
+        self._last_raw_x = None
+        self._last_raw_y = None
+        self._last_timestamp = None
+        self._continuous_since = None
+
+    def miss(self, timestamp: float) -> None:
+        timestamp = float(timestamp)
+        self._continuous_since = None
+        if (
+            self._last_timestamp is not None
+            and timestamp - self._last_timestamp >= self.reset_after_sec
+        ):
+            self.reset()
+
+    def update(self, x: float, y: float, timestamp: float) -> FilteredPoint:
+        x, y, timestamp = float(x), float(y), float(timestamp)
+        if not all(math.isfinite(value) for value in (x, y, timestamp)):
+            return FilteredPoint(False, True, 0.0, 0.0, False)
+
+        if self._last_timestamp is not None:
+            dt = timestamp - self._last_timestamp
+            if dt < 0.0:
+                return FilteredPoint(False, True, self._x, self._y, False)
+            if dt >= self.reset_after_sec:
+                self.reset()
+
+        if self._last_timestamp is None:
+            self._x, self._y = x, y
+            self._continuous_since = timestamp
+        else:
+            dt = max(0.0, timestamp - self._last_timestamp)
+            jump = math.hypot(x - self._last_raw_x, y - self._last_raw_y)
+            allowed_jump = self.jump_allowance_px + self.max_speed_px_sec * dt
+            if jump > allowed_jump:
+                self._continuous_since = None
+                return FilteredPoint(False, True, self._x, self._y, False)
+            alpha = 1.0 - math.exp(-dt / self.smoothing_tau_sec)
+            self._x = (1.0 - alpha) * self._x + alpha * x
+            self._y = (1.0 - alpha) * self._y + alpha * y
+            if self._continuous_since is None:
+                self._continuous_since = timestamp
+
+        self._last_raw_x = x
+        self._last_raw_y = y
+        self._last_timestamp = timestamp
+        locked = timestamp - self._continuous_since >= self.lock_time_sec
+        return FilteredPoint(True, False, self._x, self._y, locked)
+
+
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 

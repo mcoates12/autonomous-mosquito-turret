@@ -9,6 +9,7 @@ sys.path.insert(0, str(SRC_DIR))
 from tracking_core import (
     EveryNFrames,
     TargetObservation,
+    TimeBasedTargetFilter,
     degrees_to_position_ticks,
     position_ticks_to_degrees,
     sanitize_motion_profile,
@@ -39,6 +40,39 @@ class TargetObservationTests(unittest.TestCase):
             label="mosquito",
         )
         self.assertEqual(target.centroid, (101, 50))
+
+
+class TimeBasedTargetFilterTests(unittest.TestCase):
+    def test_smoothing_depends_on_elapsed_time_not_frame_count(self):
+        def run(rate_hz):
+            point_filter = TimeBasedTargetFilter(lock_time_sec=0.0)
+            point_filter.update(0.0, 0.0, 0.0)
+            result = None
+            for frame in range(1, int(rate_hz * 0.1) + 1):
+                result = point_filter.update(100.0, 0.0, frame / rate_hz)
+            return result.x
+
+        self.assertAlmostEqual(run(30.0), run(60.0), places=6)
+
+    def test_lock_uses_elapsed_time(self):
+        point_filter = TimeBasedTargetFilter(lock_time_sec=0.05)
+        self.assertFalse(point_filter.update(10.0, 10.0, 1.0).locked)
+        self.assertFalse(point_filter.update(10.0, 10.0, 1.04).locked)
+        self.assertTrue(point_filter.update(10.0, 10.0, 1.05).locked)
+
+    def test_outlier_is_rejected_then_reacquired_after_timeout(self):
+        point_filter = TimeBasedTargetFilter(
+            reset_after_sec=0.15,
+            max_speed_px_sec=100.0,
+            jump_allowance_px=5.0,
+        )
+        point_filter.update(10.0, 10.0, 1.0)
+        rejected = point_filter.update(1000.0, 1000.0, 1.01)
+        self.assertFalse(rejected.accepted)
+        self.assertTrue(rejected.outlier)
+        reacquired = point_filter.update(1000.0, 1000.0, 1.20)
+        self.assertTrue(reacquired.accepted)
+        self.assertAlmostEqual(reacquired.x, 1000.0)
 
 
 class PositionConversionTests(unittest.TestCase):

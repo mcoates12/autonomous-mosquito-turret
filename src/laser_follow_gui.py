@@ -4,25 +4,33 @@ import os
 from pathlib import Path
 
 JETSON_QT_PLUGIN_PATH = "/usr/lib/aarch64-linux-gnu/qt5/plugins"
+MAX_60_FPS_EXPOSURE_ABSOLUTE = 160
 if os.path.isdir(JETSON_QT_PLUGIN_PATH):
     os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", JETSON_QT_PLUGIN_PATH)
 
 import sys
 import time
 import threading
+import subprocess
 from dataclasses import dataclass
-from typing import Optional, Protocol, Tuple
+from typing import Callable, Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
 
 import logging
+from logging.handlers import RotatingFileHandler
 from collections import deque
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from pan_tilt_control import DynamixelPanTilt, FixedRatePanTiltController
-from tracking_core import ControlTarget, EveryNFrames, TargetObservation
+from tracking_core import (
+    ControlTarget,
+    EveryNFrames,
+    TargetObservation,
+    TimeBasedTargetFilter,
+)
 
 # -----------------------------
 # Statistics tracking
@@ -35,6 +43,8 @@ class Stats:
         # counts
         self.frames = 0
         self.found = 0
+        self.outliers = 0
+        self.frame_times = deque(maxlen=240)
 
         self.depth_attempt = 0
         self.depth_roi_calls = 0
@@ -59,26 +69,42 @@ class Stats:
     def _avg(dq):
         return (sum(dq) / len(dq)) if dq else 0.0
 
+    def record_frame(self) -> None:
+        self.frames += 1
+        now = time.monotonic()
+        self.frame_times.append(now)
+        while self.frame_times and now - self.frame_times[0] > 2.0:
+            self.frame_times.popleft()
+
+    def rolling_fps(self) -> float:
+        if len(self.frame_times) < 2:
+            return 0.0
+        elapsed = self.frame_times[-1] - self.frame_times[0]
+        return (len(self.frame_times) - 1) / max(1e-6, elapsed)
+
     def hud(self):
         # quick one-liner for overlay
-        return (f"FPS~{self.frames/max(1e-6,(time.monotonic()-self.t0)):.1f} "
-                f"found={self.found}/{self.frames} "
+        return (f"FPS~{self.rolling_fps():.1f} "
+                f"found={self.found}/{self.frames} outlier={self.outliers} "
                 f"ROI ok={self.depth_roi_ok}/{self.depth_roi_calls} "
                 f"FULL={self.depth_full_calls} "
                 f"lock={self.locked_frames} move={self.move_frames}")
 
-    def log_once_per_sec(self, logger):
+    def log_once_per_sec(
+        self, logger, controller_state=None, camera_health=None
+    ):
         now = time.monotonic()
         if now - self.last_log < 1.0:
             return
         self.last_log = now
 
         logger.info(
-            "fps=%.1f found=%d/%d depthAttempt=%d ROI=%d ok=%d fail=%d FULL=%d ok=%d fail=%d "
+            "fps=%.1f found=%d/%d outlier=%d depthAttempt=%d ROI=%d ok=%d fail=%d FULL=%d ok=%d fail=%d "
             "ms(cap=%.1f rect=%.1f det=%.1f roi=%.1f full=%.1f loop=%.1f) "
             "locked=%d move=%d",
-            self.frames / max(1e-6, (now - self.t0)),
+            self.rolling_fps(),
             self.found, self.frames,
+            self.outliers,
             self.depth_attempt,
             self.depth_roi_calls, self.depth_roi_ok, self.depth_roi_fail,
             self.depth_full_calls, self.depth_full_ok, self.depth_full_fail,
@@ -86,19 +112,79 @@ class Stats:
             self._avg(self.ms_depth_roi), self._avg(self.ms_depth_full), self._avg(self.ms_loop),
             self.locked_frames, self.move_frames
         )
+        if controller_state is not None:
+            logger.info(
+                "control hz=%.1f misses=%d io_ms(read=%.2f write=%.2f) "
+                "error_deg(pan=%.2f tilt=%.2f) "
+                "health(load=%.1f/%.1f%% voltage=%.1f/%.1fV temp=%d/%dC hw=0x%02x/0x%02x) "
+                "target_age=%s",
+                controller_state.controller_rate_hz,
+                controller_state.deadline_misses,
+                controller_state.feedback_read_ms,
+                controller_state.command_write_ms,
+                controller_state.pan_command_deg - controller_state.pan_actual_deg,
+                controller_state.tilt_command_deg - controller_state.tilt_actual_deg,
+                controller_state.pan_load_percent,
+                controller_state.tilt_load_percent,
+                controller_state.pan_voltage,
+                controller_state.tilt_voltage,
+                controller_state.pan_temperature_c,
+                controller_state.tilt_temperature_c,
+                controller_state.pan_hardware_error,
+                controller_state.tilt_hardware_error,
+                (
+                    "NA"
+                    if controller_state.target_age_s is None
+                    else f"{controller_state.target_age_s:.3f}s"
+                ),
+            )
+        if camera_health is not None:
+            left_health, right_health = camera_health
+            logger.info(
+                "camera left(ok=%s age=%s failures=%d reconnects=%d) "
+                "right(ok=%s age=%s failures=%d reconnects=%d)",
+                left_health.connected,
+                "NA" if left_health.frame_age_sec is None else f"{left_health.frame_age_sec:.3f}s",
+                left_health.consecutive_failures,
+                left_health.reconnects,
+                right_health.connected,
+                "NA" if right_health.frame_age_sec is None else f"{right_health.frame_age_sec:.3f}s",
+                right_health.consecutive_failures,
+                right_health.reconnects,
+            )
 
 # -----------------------------
 # Latest frame grabber thread
 # -----------------------------
+@dataclass(frozen=True)
+class CameraHealth:
+    connected: bool
+    consecutive_failures: int
+    reconnects: int
+    frame_age_sec: Optional[float]
+
+
 class LatestFrame:
-    def __init__(self, cap: cv2.VideoCapture, name: str):
+    REOPEN_AFTER_FAILURES = 5
+    REOPEN_BACKOFF_SEC = 0.50
+
+    def __init__(
+        self,
+        cap: Optional[cv2.VideoCapture],
+        name: str,
+        reopen_factory: Optional[Callable[[], cv2.VideoCapture]] = None,
+    ):
         self.cap = cap
         self.name = name
+        self.reopen_factory = reopen_factory
         self.condition = threading.Condition()
         self.frame = None
         self.ok = False
         self.timestamp = 0.0
         self.sequence = 0
+        self.consecutive_failures = 0
+        self.reconnects = 0
+        self._last_reopen_attempt = 0.0
         self.stop_evt = threading.Event()
         self.th = threading.Thread(target=self._run, daemon=True)
 
@@ -107,13 +193,61 @@ class LatestFrame:
 
     def stop(self):
         self.stop_evt.set()
+        cap = self.cap
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
         with self.condition:
             self.condition.notify_all()
-        self.th.join(timeout=1.0)
+        self.th.join(timeout=3.0)
+        return not self.th.is_alive()
+
+    def _reopen(self) -> bool:
+        if self.reopen_factory is None or self.stop_evt.is_set():
+            return False
+        now = time.monotonic()
+        if now - self._last_reopen_attempt < self.REOPEN_BACKOFF_SEC:
+            return False
+        self._last_reopen_attempt = now
+        old_cap = self.cap
+        if old_cap is not None:
+            try:
+                old_cap.release()
+            except Exception:
+                pass
+        try:
+            new_cap = self.reopen_factory()
+        except Exception:
+            self.cap = None
+            return False
+        if self.stop_evt.is_set():
+            new_cap.release()
+            self.cap = None
+            return False
+        if not new_cap.isOpened():
+            new_cap.release()
+            self.cap = None
+            return False
+        self.cap = new_cap
+        self.consecutive_failures = 0
+        self.reconnects += 1
+        return True
 
     def _run(self):
         while not self.stop_evt.is_set():
-            ok, f = self.cap.read()
+            cap = self.cap
+            if cap is None or not cap.isOpened():
+                self.ok = False
+                self._reopen()
+                self.stop_evt.wait(0.05)
+                continue
+
+            try:
+                ok, f = cap.read()
+            except Exception:
+                ok, f = False, None
             captured_at = time.monotonic()
             with self.condition:
                 self.ok = ok
@@ -123,7 +257,17 @@ class LatestFrame:
                     self.frame = f
                     self.timestamp = captured_at
                     self.sequence += 1
+                    self.consecutive_failures = 0
+                else:
+                    self.consecutive_failures += 1
                 self.condition.notify_all()
+            if not ok:
+                if (
+                    not self.stop_evt.is_set()
+                    and self.consecutive_failures >= self.REOPEN_AFTER_FAILURES
+                ):
+                    self._reopen()
+                self.stop_evt.wait(0.005)
 
     def get(self):
         """Return the immutable latest-frame reference without copying pixels."""
@@ -141,6 +285,20 @@ class LatestFrame:
             if self.sequence == last_sequence and not self.stop_evt.is_set():
                 self.condition.wait(timeout=timeout)
             return self.ok, self.frame, self.timestamp, self.sequence
+
+    def health(self) -> CameraHealth:
+        with self.condition:
+            age = (
+                None
+                if self.timestamp <= 0.0
+                else max(0.0, time.monotonic() - self.timestamp)
+            )
+            return CameraHealth(
+                connected=self.ok,
+                consecutive_failures=self.consecutive_failures,
+                reconnects=self.reconnects,
+                frame_age_sec=age,
+            )
 
 # -----------------------------
 # GStreamer pipeline helper
@@ -178,6 +336,21 @@ class LiveParams:
     # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
     area_hi_gate: float = 40.0    # reject huge blobs
+    smoothing_tau_ms: float = 60.0
+    lock_time_ms: float = 50.0
+    outlier_speed_px_s: float = 8000.0
+    laser_roi_half_size: int = 160
+
+    # AR0234 V4L2 controls. Fixed exposure/white balance keeps the detector's
+    # HSV thresholds stable instead of letting the image change underneath it.
+    manual_exposure: bool = True
+    # Standard V4L2 units are 100 us. 100 = 10 ms; keep the GUI at or below
+    # 16 ms so exposure cannot silently force a nominal 60 FPS stream slower.
+    exposure_time_absolute: int = 100
+    camera_gain: int = 1
+    auto_white_balance: bool = False
+    white_balance_temperature: int = 4600
+    low_latency_mode: bool = True
 
     # control
     deg_per_px_pan: float = 0.0060
@@ -210,6 +383,67 @@ class ParamStore:
             setattr(self._p, name, value)
 
 
+def v4l2_control_signature(p: LiveParams) -> Tuple[object, ...]:
+    """Return the camera settings whose changes require a V4L2 update."""
+    return (
+        p.manual_exposure,
+        p.exposure_time_absolute,
+        p.camera_gain,
+        p.auto_white_balance,
+        p.white_balance_temperature,
+        p.low_latency_mode,
+    )
+
+
+def apply_v4l2_camera_controls(device: str, p: LiveParams) -> Optional[str]:
+    """Apply known AR0234 controls without making camera startup depend on them.
+
+    Mode controls are sent first because exposure time and white-balance
+    temperature are only meaningful after their automatic modes are disabled.
+    A failure is returned to the caller for diagnostics; capture may still run.
+    """
+    mode_controls = (
+        f"exposure_auto={1 if p.manual_exposure else 0}",
+        f"white_balance_automatic={1 if p.auto_white_balance else 0}",
+        f"low_latency_mode={1 if p.low_latency_mode else 0}",
+    )
+    value_controls = [f"gain={p.camera_gain}"]
+    if p.manual_exposure:
+        value_controls.append(
+            f"exposure_time_absolute={p.exposure_time_absolute}"
+        )
+    if not p.auto_white_balance:
+        value_controls.append(
+            f"white_balance_temperature={p.white_balance_temperature}"
+        )
+
+    for controls in (mode_controls, tuple(value_controls)):
+        command = [
+            "v4l2-ctl",
+            "-d",
+            device,
+            "--set-ctrl",
+            ",".join(controls),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"{device}: v4l2-ctl failed: {exc}"
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            return (
+                f"{device}: v4l2-ctl exited {result.returncode}"
+                + (f": {detail}" if detail else "")
+            )
+    return None
+
+
 class TargetDetector(Protocol):
     """Interface implemented by the laser detector and a future AI detector."""
 
@@ -225,6 +459,9 @@ class TargetDetector(Protocol):
 # -----------------------------
 # Red laser detection (HSV)
 # -----------------------------
+LASER_MORPH_KERNEL = np.ones((3, 3), np.uint8)
+
+
 def find_laser_target_red(
     frame_bgr: np.ndarray,
     p: LiveParams,
@@ -243,12 +480,15 @@ def find_laser_target_red(
     lower2 = np.array([170, p.s_thresh, p.v_thresh], dtype=np.uint8)
     upper2 = np.array([179, 255,        255],        dtype=np.uint8)
 
-    mask = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1),
-                          cv2.inRange(hsv, lower2, upper2))
+    threshold_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, lower1, upper1),
+        cv2.inRange(hsv, lower2, upper2),
+    )
 
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.dilate(mask, kernel, iterations=2)
+    mask = cv2.morphologyEx(
+        threshold_mask, cv2.MORPH_OPEN, LASER_MORPH_KERNEL, iterations=1
+    )
+    mask = cv2.dilate(mask, LASER_MORPH_KERNEL, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -281,14 +521,24 @@ def find_laser_target_red(
     if peak_v < int(p.peak_v_gate):
         return None, mask
 
-    M = cv2.moments(best)
-    if M["m00"] == 0:
+    # Brightness-weighted subpixel centroid. The raw (pre-dilation) threshold
+    # mask prevents the morphology halo from shifting the measurement.
+    roi_binary = threshold_mask[y:y+h2, x:x+w].astype(np.float32) / 255.0
+    brightness = np.maximum(
+        roi_v.astype(np.float32) - float(p.v_thresh) + 1.0,
+        0.0,
+    )
+    weights = roi_binary * brightness
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
         return None, mask
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
+    column_weights = np.sum(weights, axis=0)
+    row_weights = np.sum(weights, axis=1)
+    cx = float(x) + float(np.dot(column_weights, np.arange(w))) / weight_sum
+    cy = float(y) + float(np.dot(row_weights, np.arange(h2))) / weight_sum
     target = TargetObservation(
-        x=float(cx),
-        y=float(cy),
+        x=cx,
+        y=cy,
         confidence=peak_v / 255.0,
         timestamp=time.monotonic() if frame_timestamp is None else frame_timestamp,
         label="red_laser",
@@ -298,13 +548,67 @@ def find_laser_target_red(
 
 
 class RedLaserDetector:
+    """Full-frame acquisition followed by expanding, low-cost ROI tracking."""
+
+    FULL_SEARCH_AFTER_MISSES = 3
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self._last_x = None
+        self._last_y = None
+        self._misses = 0
+
     def detect(
         self,
         frame_bgr: np.ndarray,
         params: LiveParams,
         frame_timestamp: float,
     ) -> Tuple[Optional[TargetObservation], np.ndarray]:
-        return find_laser_target_red(frame_bgr, params, frame_timestamp)
+        height, width = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = 0, 0, width, height
+        if (
+            self._last_x is not None
+            and self._misses < self.FULL_SEARCH_AFTER_MISSES
+        ):
+            base_half_size = max(32, int(params.laser_roi_half_size))
+            half_size = base_half_size * (2 ** self._misses)
+            center_x = int(round(self._last_x))
+            center_y = int(round(self._last_y))
+            x1 = max(0, center_x - half_size)
+            y1 = max(0, center_y - half_size)
+            x2 = min(width, center_x + half_size)
+            y2 = min(height, center_y + half_size)
+
+        target, mask = find_laser_target_red(
+            frame_bgr[y1:y2, x1:x2], params, frame_timestamp
+        )
+        if target is None:
+            self._misses += 1
+            return None, mask
+
+        bbox = target.bbox_xyxy
+        adjusted_bbox = None
+        if bbox is not None:
+            adjusted_bbox = (
+                bbox[0] + x1,
+                bbox[1] + y1,
+                bbox[2] + x1,
+                bbox[3] + y1,
+            )
+        adjusted = TargetObservation(
+            x=target.x + x1,
+            y=target.y + y1,
+            confidence=target.confidence,
+            timestamp=target.timestamp,
+            label=target.label,
+            bbox_xyxy=adjusted_bbox,
+        )
+        self._last_x = adjusted.x
+        self._last_y = adjusted.y
+        self._misses = 0
+        return adjusted, mask
 
 
 def find_laser_centroid_red(frame_bgr, p: LiveParams):
@@ -548,12 +852,13 @@ class StereoDepthWorker:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         with self._lock:
             self._stop = True
             self._pending = None
         self._wake.set()
         self._thread.join(timeout=2.0)
+        return not self._thread.is_alive()
 
     def submit(self, request: DepthRequest) -> bool:
         """Accept work only when idle so depth can never build a backlog."""
@@ -675,6 +980,7 @@ class StereoDepthWorker:
 # -----------------------------
 class LaserWorker(QtCore.QThread):
     error_signal = QtCore.pyqtSignal(str)
+    status_signal = QtCore.pyqtSignal(str)
 
     def __init__(self, store: ParamStore, cam_left: int, cam_right: int, width: int, height: int,
              port: str, baud: int, pan_id: int, tilt_id: int, calib_path: str,
@@ -696,6 +1002,12 @@ class LaserWorker(QtCore.QThread):
         self._stop = threading.Event()
         self.turret = None
         self.controller = None
+        self.servo_note = "servo not connected"
+        self._next_servo_retry_at = 0.0
+        self._servo_fault_latched = False
+        self._last_camera_status_at = 0.0
+        self._last_camera_control_signature = None
+        self.camera_control_note = ""
         self.detector = detector if detector is not None else RedLaserDetector()
         self._last_track_sequence = {"Left": 0, "Right": 0}
         self._active_track_source = None
@@ -707,16 +1019,13 @@ class LaserWorker(QtCore.QThread):
         self._latest_preview = None
 
 
-        # centroid smoothing (EMA)
-        self.cx_f = None
-        self.cy_f = None
-        self.alpha = 0.25
-
-        # lock-on gating
-        self.lock_count = 0
-        self.LOCK_N = 3
-        self.miss_count = 0
-        self.MISS_RESET_N = 3
+        self.target_filter = TimeBasedTargetFilter(
+            smoothing_tau_sec=0.06,
+            lock_time_sec=0.05,
+            reset_after_sec=0.15,
+            max_speed_px_sec=8000.0,
+            jump_allowance_px=40.0,
+        )
         # Depth runs much more slowly than detection/control. It consumes a
         # model-neutral TargetObservation, so a future AI detector can use the
         # same rectification and depth path.
@@ -740,6 +1049,96 @@ class LaserWorker(QtCore.QThread):
     def stop(self):
         self._stop.set()
 
+    def clear_servo_fault(self) -> None:
+        self._servo_fault_latched = False
+        self._next_servo_retry_at = 0.0
+
+    def _disconnect_servo(self) -> None:
+        controller = self.controller
+        turret = self.turret
+        self.controller = None
+        self.turret = None
+        safe_to_close = True
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                # Do not close a serial port that a blocked controller thread
+                # could still be using. Its stop flag and servo watchdog remain
+                # armed, so it will torque off when the SDK call returns.
+                safe_to_close = False
+        if turret is not None and safe_to_close:
+            try:
+                turret.close()
+            except Exception:
+                pass
+
+    def _try_connect_servo(self, logger) -> None:
+        if self.controller is not None:
+            return
+        turret = None
+        try:
+            turret = DynamixelPanTilt(
+                self.port, self.baud, self.pan_id, self.tilt_id
+            )
+            turret.open()
+            controller = FixedRatePanTiltController(turret, self.store)
+            controller.start()
+            self.turret = turret
+            self.controller = controller
+            self.servo_note = ""
+            logger.info(
+                "configured servo limits pan=%.2f..%.2f deg "
+                "tilt=%.2f..%.2f deg; initial pan=%.2f deg tilt=%.2f deg",
+                turret.pan_min,
+                turret.pan_max,
+                turret.tilt_min,
+                turret.tilt_max,
+                turret.pan_actual,
+                turret.tilt_actual,
+            )
+        except Exception as exc:
+            if turret is not None:
+                try:
+                    turret.close()
+                except Exception:
+                    pass
+            self.servo_note = str(exc)
+            self._next_servo_retry_at = time.monotonic() + 2.0
+            logger.warning("servo unavailable; vision remains active: %s", exc)
+
+    def _apply_camera_controls(self, p: LiveParams, logger, force=False) -> None:
+        signature = v4l2_control_signature(p)
+        if not force and signature == self._last_camera_control_signature:
+            return
+
+        errors = []
+        for camera_index in (self.cam_left, self.cam_right):
+            device = f"/dev/video{camera_index}"
+            error = apply_v4l2_camera_controls(device, p)
+            if error is not None:
+                errors.append(error)
+
+        self._last_camera_control_signature = signature
+        if errors:
+            self.camera_control_note = "; ".join(errors)
+            logger.warning(
+                "camera controls could not be fully applied; capture will continue: %s",
+                self.camera_control_note,
+            )
+        else:
+            self.camera_control_note = ""
+            logger.info(
+                "camera controls manual_exposure=%s exposure=%d gain=%d "
+                "auto_wb=%s wb_temp=%d low_latency=%s",
+                p.manual_exposure,
+                p.exposure_time_absolute,
+                p.camera_gain,
+                p.auto_white_balance,
+                p.white_balance_temperature,
+                p.low_latency_mode,
+            )
+
     def request_preview(self) -> None:
         with self._preview_lock:
             self._preview_requested = True
@@ -760,7 +1159,18 @@ class LaserWorker(QtCore.QThread):
         with self._preview_lock:
             self._latest_preview = PreviewFrame(frame_bgr, mask, status)
 
-    def _compose_preview_frame(self, left: np.ndarray, right: np.ndarray, p: LiveParams):
+    def _compose_preview_frame(
+        self,
+        left: Optional[np.ndarray],
+        right: Optional[np.ndarray],
+        p: LiveParams,
+    ):
+        if left is None and right is None:
+            raise RuntimeError("no camera frame is available for preview")
+        if left is None:
+            return right.copy(), 0
+        if right is None:
+            return left.copy(), 0
         if p.display_mode == "Left":
             return left.copy(), 0
         if p.display_mode == "Right":
@@ -782,6 +1192,20 @@ class LaserWorker(QtCore.QThread):
 
     def run(self):
         try:
+            logger = logging.getLogger("turret")
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            if not logger.handlers:
+                log_handler = RotatingFileHandler(
+                    "laser_follow_debug.log",
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=3,
+                )
+                log_handler.setFormatter(
+                    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+                )
+                logger.addHandler(log_handler)
+
             pipeL = gst_v4l2_bgr_pipeline(
                 f"/dev/video{self.cam_left}", self.width, self.height, fps=60
             )
@@ -789,82 +1213,106 @@ class LaserWorker(QtCore.QThread):
                 f"/dev/video{self.cam_right}", self.width, self.height, fps=60
             )
 
-            self.capL = cv2.VideoCapture(pipeL, cv2.CAP_GSTREAMER)
-            self.capR = cv2.VideoCapture(pipeR, cv2.CAP_GSTREAMER)
-            
-            if not self.capL.isOpened() or not self.capR.isOpened():
-                raise RuntimeError("Could not open both cameras (left/right). Check /dev/video* indexes.")
+            self._apply_camera_controls(self.store.get(), logger, force=True)
 
-            self.readerL = LatestFrame(self.capL, "L")
-            self.readerR = LatestFrame(self.capR, "R")
+            def open_capture(device: str, pipeline: str) -> cv2.VideoCapture:
+                # A reconnect can reset driver controls, so reapply them before
+                # every new GStreamer capture instance.
+                error = apply_v4l2_camera_controls(device, self.store.get())
+                if error is not None:
+                    logger.warning("camera reconnect controls: %s", error)
+                capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                if capture.isOpened():
+                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                return capture
+
+            device_l = f"/dev/video{self.cam_left}"
+            device_r = f"/dev/video{self.cam_right}"
+            self.capL = open_capture(device_l, pipeL)
+            self.capR = open_capture(device_r, pipeR)
+
+            self.readerL = LatestFrame(
+                self.capL,
+                "L",
+                reopen_factory=lambda: open_capture(device_l, pipeL),
+            )
+            self.readerR = LatestFrame(
+                self.capR,
+                "R",
+                reopen_factory=lambda: open_capture(device_r, pipeR),
+            )
             self.readerL.start()
             self.readerR.start()
- 
-            for cap in (self.capL, self.capR):
-               # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-               # cap.set(cv2.CAP_PROP_EXPOSURE, -7)
-               # cap.set(cv2.CAP_PROP_GAIN, 0)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-               # cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                
-            # Load stereo calibration + build rectify maps + SGBM
-            self.stereo = StereoBundle(self.calib_path)
-            self.depth_worker = StereoDepthWorker(
-                stereo=self.stereo,
-                roi_size=self.ROI_SIZE,
-                roi_patch=self.ROI_PATCH,
-                roi_fail_to_full=self.ROI_FAIL_TO_FULL,
-                full_cooldown_sec=self.FULL_COOLDOWN_SEC,
-                max_stereo_skew_sec=self.MAX_STEREO_SKEW_SEC,
-            )
-            self.depth_worker.start()
 
-            self.turret = DynamixelPanTilt(self.port, self.baud, self.pan_id, self.tilt_id)
-            self.turret.open()
-            self.controller = FixedRatePanTiltController(self.turret, self.store)
-            self.controller.start()
-            
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s %(levelname)s %(message)s",
-                filename="laser_follow_debug.log",
-                filemode="a",
-            )
-            logger = logging.getLogger("turret")
+            # Load stereo calibration + build rectify maps + SGBM
+            try:
+                self.stereo = StereoBundle(self.calib_path)
+                self.depth_worker = StereoDepthWorker(
+                    stereo=self.stereo,
+                    roi_size=self.ROI_SIZE,
+                    roi_patch=self.ROI_PATCH,
+                    roi_fail_to_full=self.ROI_FAIL_TO_FULL,
+                    full_cooldown_sec=self.FULL_COOLDOWN_SEC,
+                    max_stereo_skew_sec=self.MAX_STEREO_SKEW_SEC,
+                )
+                self.depth_worker.start()
+            except Exception as exc:
+                self.stereo = None
+                self.depth_worker = None
+                self.last_depth_note = f"stereo disabled: {exc}"
+
             stats = Stats()
-            logger.info(
-                "configured servo limits pan=%.2f..%.2f deg tilt=%.2f..%.2f deg; "
-                "initial pan=%.2f deg tilt=%.2f deg",
-                self.turret.pan_min,
-                self.turret.pan_max,
-                self.turret.tilt_min,
-                self.turret.tilt_max,
-                self.turret.pan_actual,
-                self.turret.tilt_actual,
-            )
+            if self.last_depth_note:
+                logger.warning(self.last_depth_note)
+            self._try_connect_servo(logger)
 
             while not self._stop.is_set():
                 t_loop0 = time.perf_counter()
                 p = self.store.get()
+                self._apply_camera_controls(p, logger)
 
                 if p.track_source != self._active_track_source:
                     self._active_track_source = p.track_source
-                    self.cx_f = None
-                    self.cy_f = None
-                    self.lock_count = 0
-                    self.miss_count = 0
+                    self.target_filter.reset()
+                    if hasattr(self.detector, "reset"):
+                        self.detector.reset()
                     self.depth_cadence.reset(due_immediately=True)
-                    self.controller.clear_target()
+                    if self.controller is not None:
+                        self.controller.clear_target()
 
-                controller_state = self.controller.snapshot()
-                if controller_state.error is not None:
-                    raise RuntimeError(
-                        f"Servo controller stopped: {controller_state.error}"
+                controller_state = (
+                    None if self.controller is None else self.controller.snapshot()
+                )
+                if (
+                    controller_state is not None
+                    and controller_state.error is not None
+                ):
+                    self.servo_note = controller_state.error
+                    logger.error("servo controller stopped: %s", self.servo_note)
+                    self._disconnect_servo()
+                    self._servo_fault_latched = True
+                    controller_state = None
+                if (
+                    self.controller is None
+                    and p.servos_enabled
+                    and not self._servo_fault_latched
+                    and time.monotonic() >= self._next_servo_retry_at
+                ):
+                    self._try_connect_servo(logger)
+                    controller_state = (
+                        None
+                        if self.controller is None
+                        else self.controller.snapshot()
                     )
-                stats.move_frames = controller_state.move_updates
+                if controller_state is not None:
+                    stats.move_frames = controller_state.move_updates
 
-                depth_result = self.depth_worker.take_result()
+                depth_result = (
+                    None
+                    if self.depth_worker is None
+                    else self.depth_worker.take_result()
+                )
                 if depth_result is not None:
                     self.last_depth_note = depth_result.note
                     if depth_result.rect_ms > 0.0:
@@ -902,19 +1350,46 @@ class LaserWorker(QtCore.QThread):
                     )
                     okL, left, captured_at_l, sequence_l = self.readerL.get()
                     track_sequence = sequence_r
-                if left is None or right is None:
+                track_frame = left if p.track_source == "Left" else right
+                if track_frame is None:
+                    now = time.monotonic()
+                    if now - self._last_camera_status_at >= 0.5:
+                        selected_reader = (
+                            self.readerL if p.track_source == "Left" else self.readerR
+                        )
+                        health = selected_reader.health()
+                        self.status_signal.emit(
+                            f"Waiting for {p.track_source} camera; "
+                            f"failures={health.consecutive_failures} "
+                            f"reconnects={health.reconnects}"
+                        )
+                        self._last_camera_status_at = now
                     continue
 
                 stats.ms_cap.append((time.perf_counter() - t0) * 1000.0)
-                if not okL or not okR:
-                    raise RuntimeError("Camera read failed (left or right).")
                 if track_sequence == self._last_track_sequence[p.track_source]:
+                    now = time.monotonic()
+                    selected_reader = (
+                        self.readerL if p.track_source == "Left" else self.readerR
+                    )
+                    health = selected_reader.health()
+                    if (
+                        health.frame_age_sec is not None
+                        and health.frame_age_sec >= 0.5
+                        and now - self._last_camera_status_at >= 0.5
+                    ):
+                        self.status_signal.emit(
+                            f"Reconnecting {p.track_source} camera; "
+                            f"last frame={health.frame_age_sec:.1f}s ago "
+                            f"reconnects={health.reconnects}"
+                        )
+                        self._last_camera_status_at = now
                     continue
                 self._last_track_sequence[p.track_source] = track_sequence
 
                 # Detection and control stay on raw frames. Full-frame stereo
                 # rectification happens only on scheduled depth updates.
-                track_img = left if p.track_source == "Left" else right
+                track_img = track_frame
                 track_timestamp = captured_at_l if p.track_source == "Left" else captured_at_r
 
                 # Detector output is model-neutral. A future AI detector only
@@ -923,47 +1398,57 @@ class LaserWorker(QtCore.QThread):
                 target, mask = self.detector.detect(track_img, p, track_timestamp)
                 stats.ms_det.append((time.perf_counter() - t0) * 1000.0)
 
+                filtered_target = None
+                if target is not None:
+                    stats.found += 1
+                    self.target_filter.configure(
+                        smoothing_tau_sec=p.smoothing_tau_ms / 1000.0,
+                        lock_time_sec=p.lock_time_ms / 1000.0,
+                        max_speed_px_sec=p.outlier_speed_px_s,
+                    )
+                    filtered_target = self.target_filter.update(
+                        target.x, target.y, target.timestamp
+                    )
+                    if not filtered_target.accepted:
+                        if filtered_target.outlier:
+                            stats.outliers += 1
+                        target = None
+
                 cx0, cy0 = self.width // 2, self.height // 2
                 status = ""
                 preview_target = None
                 depth_str = "depth=NA"
-                stats.frames += 1
+                stats.record_frame()
                 if target is not None:
-                    stats.found += 1
-                    self.miss_count = 0
-                    cx, cy = target.centroid
-
-                    # EMA smoothing
-                    if self.cx_f is None:
-                        self.cx_f, self.cy_f = float(cx), float(cy)
-                    else:
-                        self.cx_f = (1 - self.alpha) * self.cx_f + self.alpha * float(cx)
-                        self.cy_f = (1 - self.alpha) * self.cy_f + self.alpha * float(cy)
-
-                    cx_use = int(round(self.cx_f))
-                    cy_use = int(round(self.cy_f))
+                    cx_use = int(round(filtered_target.x))
+                    cy_use = int(round(filtered_target.y))
                     preview_target = (cx_use, cy_use)
 
-                    err_x = cx_use - cx0
-                    err_y = cy_use - cy0
+                    err_x = filtered_target.x - cx0
+                    err_y = filtered_target.y - cy0
                     
-                    # lock-on gating
-                    self.lock_count = min(self.LOCK_N, self.lock_count + 1)
-                    locked = (self.lock_count >= self.LOCK_N)
+                    locked = filtered_target.locked
 
-                    self.controller.publish_target(
-                        ControlTarget(
-                            error_x_px=float(err_x),
-                            error_y_px=float(err_y),
-                            timestamp=target.timestamp,
-                            locked=locked,
+                    if self.controller is not None:
+                        self.controller.publish_target(
+                            ControlTarget(
+                                error_x_px=float(err_x),
+                                error_y_px=float(err_y),
+                                timestamp=target.timestamp,
+                                locked=locked,
+                            )
                         )
-                    )
                     
                     depth_eligible = locked and (p.track_source == "Left")
                     if not depth_eligible:
                         self.depth_cadence.reset(due_immediately=True)
-                    do_depth = depth_eligible and self.depth_cadence.step()
+                    do_depth = (
+                        depth_eligible
+                        and self.depth_worker is not None
+                        and left is not None
+                        and right is not None
+                        and self.depth_cadence.step()
+                    )
 
                     if do_depth:
                         accepted = self.depth_worker.submit(
@@ -995,32 +1480,35 @@ class LaserWorker(QtCore.QThread):
                     if locked:
                         stats.locked_frames += 1
 
+                    if controller_state is None:
+                        servo_status = f"servo=OFFLINE ({self.servo_note})"
+                    else:
+                        servo_status = (
+                            f"torque={'ON' if controller_state.torque_enabled else 'OFF'} "
+                            f"pan={controller_state.pan_actual_deg:.1f}/"
+                            f"{controller_state.pan_command_deg:.1f} "
+                            f"tilt={controller_state.tilt_actual_deg:.1f}/"
+                            f"{controller_state.tilt_command_deg:.1f} "
+                            f"ctrl={controller_state.controller_rate_hz:.1f}Hz"
+                        )
                     status = (
-                        f"FOUND  lock={self.lock_count}/{self.LOCK_N}  "
-                        f"err=({err_x},{err_y})  "
-                        f"torque={'ON' if controller_state.torque_enabled else 'OFF'}  "
-                        f"pan={controller_state.pan_actual_deg:.1f}/"
-                        f"{controller_state.pan_command_deg:.1f} "
-                        f"tilt={controller_state.tilt_actual_deg:.1f}/"
-                        f"{controller_state.tilt_command_deg:.1f} "
-                        f"vel=({controller_state.pan_velocity_deg_s:.1f},"
-                        f"{controller_state.tilt_velocity_deg_s:.1f}) deg/s  "
-                        f"{depth_str}"
+                        f"FOUND lock={'YES' if locked else 'ACQUIRING'} "
+                        f"err=({err_x:.1f},{err_y:.1f}) {servo_status} {depth_str}"
                     )
                 else:
-                    self.controller.clear_target()
-                    self.lock_count = 0
-                    self.miss_count += 1
-                    if self.miss_count >= self.MISS_RESET_N:
-                        self.cx_f = None
-                        self.cy_f = None
+                    if self.controller is not None:
+                        self.controller.clear_target()
+                    self.target_filter.miss(track_timestamp)
                     self.depth_cadence.reset(due_immediately=True)
-                    status = (
-                        "NOT FOUND  "
-                        f"torque={'ON' if controller_state.torque_enabled else 'OFF'}  "
-                        f"pan={controller_state.pan_actual_deg:.1f} "
-                        f"tilt={controller_state.tilt_actual_deg:.1f}"
-                    )
+                    if controller_state is None:
+                        status = f"NOT FOUND servo=OFFLINE ({self.servo_note})"
+                    else:
+                        status = (
+                            "NOT FOUND "
+                            f"torque={'ON' if controller_state.torque_enabled else 'OFF'} "
+                            f"pan={controller_state.pan_actual_deg:.1f} "
+                            f"tilt={controller_state.tilt_actual_deg:.1f}"
+                        )
 
                 if self._consume_preview_request():
                     frame, x_offset = self._compose_preview_frame(left, right, p)
@@ -1070,19 +1558,20 @@ class LaserWorker(QtCore.QThread):
                     )
                     self._publish_preview(frame, mask, status)
                 stats.ms_loop.append((time.perf_counter() - t_loop0) * 1000.0)
-                stats.log_once_per_sec(logger)
+                stats.log_once_per_sec(
+                    logger,
+                    controller_state,
+                    (self.readerL.health(), self.readerR.health()),
+                )
 
 
         except Exception as e:
+            logging.getLogger("turret").exception("laser worker stopped")
             self.error_signal.emit(str(e))
         finally:
             # The controller owns the serial bus. Stop it before closing the
             # port or tearing down the rest of the worker.
-            try:
-                if self.controller is not None:
-                    self.controller.stop()
-            except Exception:
-                pass
+            self._disconnect_servo()
             # Stop background stereo work before tearing down shared state.
             try:
                 if self.depth_worker is not None:
@@ -1095,12 +1584,6 @@ class LaserWorker(QtCore.QThread):
                     self.readerL.stop()
                 if hasattr(self, "readerR"):
                     self.readerR.stop()
-            except Exception:
-                pass
-            # close turret
-            try:
-                if self.turret is not None:
-                    self.turret.close()
             except Exception:
                 pass
             # release cameras
@@ -1235,6 +1718,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sb_peak_gate = integer(0, 255, p.peak_v_gate)
         self.sb_area_hi_gate = dbl(1.0, 5000.0, 10.0, p.area_hi_gate)
+        self.sb_smoothing_tau = dbl(5.0, 500.0, 5.0, p.smoothing_tau_ms)
+        self.sb_lock_time = dbl(0.0, 1000.0, 10.0, p.lock_time_ms)
+        self.sb_outlier_speed = dbl(
+            100.0, 20000.0, 100.0, p.outlier_speed_px_s
+        )
+        self.sb_laser_roi = integer(32, 960, p.laser_roi_half_size)
+
+        self.chk_manual_exposure = QtWidgets.QCheckBox()
+        self.chk_manual_exposure.setChecked(p.manual_exposure)
+        self.sb_exposure = integer(
+            1, MAX_60_FPS_EXPOSURE_ABSOLUTE, p.exposure_time_absolute
+        )
+        self.sb_camera_gain = integer(1, 40, p.camera_gain)
+        self.chk_auto_wb = QtWidgets.QCheckBox()
+        self.chk_auto_wb.setChecked(p.auto_white_balance)
+        self.sb_wb_temp = integer(10, 10000, p.white_balance_temperature)
+        self.sb_wb_temp.setSingleStep(10)
+        self.chk_low_latency = QtWidgets.QCheckBox()
+        self.chk_low_latency.setChecked(p.low_latency_mode)
 
         self.cb_pan_dir = QtWidgets.QComboBox()
         self.cb_pan_dir.addItems(["+1", "-1"])
@@ -1262,6 +1764,18 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(QtWidgets.QLabel("— Confidence Gates —"), QtWidgets.QLabel(""))
         form.addRow("peak_v_gate", self.sb_peak_gate)
         form.addRow("area_hi_gate", self.sb_area_hi_gate)
+        form.addRow("smoothing_tau_ms", self.sb_smoothing_tau)
+        form.addRow("lock_time_ms", self.sb_lock_time)
+        form.addRow("outlier_speed_px_s", self.sb_outlier_speed)
+        form.addRow("laser_roi_half_size", self.sb_laser_roi)
+
+        form.addRow(QtWidgets.QLabel("— Camera —"), QtWidgets.QLabel(""))
+        form.addRow("manual_exposure", self.chk_manual_exposure)
+        form.addRow("exposure_time_absolute", self.sb_exposure)
+        form.addRow("camera_gain", self.sb_camera_gain)
+        form.addRow("auto_white_balance", self.chk_auto_wb)
+        form.addRow("white_balance_temperature", self.sb_wb_temp)
+        form.addRow("low_latency_mode", self.chk_low_latency)
 
         ctrl.addStretch(1)
 
@@ -1301,6 +1815,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sb_peak_gate.valueChanged.connect(lambda v: self.store.set_attr("peak_v_gate", int(v)))
         self.sb_area_hi_gate.valueChanged.connect(lambda v: self.store.set_attr("area_hi_gate", float(v)))
+        self.sb_smoothing_tau.valueChanged.connect(
+            lambda v: self.store.set_attr("smoothing_tau_ms", float(v))
+        )
+        self.sb_lock_time.valueChanged.connect(
+            lambda v: self.store.set_attr("lock_time_ms", float(v))
+        )
+        self.sb_outlier_speed.valueChanged.connect(
+            lambda v: self.store.set_attr("outlier_speed_px_s", float(v))
+        )
+        self.sb_laser_roi.valueChanged.connect(
+            lambda v: self.store.set_attr("laser_roi_half_size", int(v))
+        )
+        self.chk_manual_exposure.stateChanged.connect(
+            lambda _: self.store.set_attr(
+                "manual_exposure", bool(self.chk_manual_exposure.isChecked())
+            )
+        )
+        self.sb_exposure.valueChanged.connect(
+            lambda v: self.store.set_attr("exposure_time_absolute", int(v))
+        )
+        self.sb_camera_gain.valueChanged.connect(
+            lambda v: self.store.set_attr("camera_gain", int(v))
+        )
+        self.chk_auto_wb.stateChanged.connect(
+            lambda _: self.store.set_attr(
+                "auto_white_balance", bool(self.chk_auto_wb.isChecked())
+            )
+        )
+        self.sb_wb_temp.valueChanged.connect(
+            lambda v: self.store.set_attr("white_balance_temperature", int(v))
+        )
+        self.chk_low_latency.stateChanged.connect(
+            lambda _: self.store.set_attr(
+                "low_latency_mode", bool(self.chk_low_latency.isChecked())
+            )
+        )
 
         self.cb_pan_dir.currentTextChanged.connect(lambda t: self.store.set_attr("pan_dir", int(t)))
         self.cb_tilt_dir.currentTextChanged.connect(lambda t: self.store.set_attr("tilt_dir", int(t)))
@@ -1326,6 +1876,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sb_peak_gate.setToolTip("Hard gate: require the detected blob to contain pixels with V >= this value. Strongly reduces false positives.")
         self.sb_area_hi_gate.setToolTip("Hard gate: reject any detection larger than this area even if it is red. Helps with big red patches.")
+        self.sb_smoothing_tau.setToolTip(
+            "Time-based laser smoothing in milliseconds. Lower follows faster; higher removes more jitter but adds lag."
+        )
+        self.sb_lock_time.setToolTip(
+            "Continuous valid-detection time required before servo commands are allowed."
+        )
+        self.sb_outlier_speed.setToolTip(
+            "Maximum plausible dot speed in pixels/second before a measurement is rejected as a jump."
+        )
+        self.sb_laser_roi.setToolTip(
+            "Half-width of the fast tracking search window. It expands automatically after misses."
+        )
+        self.chk_manual_exposure.setToolTip(
+            "Use a fixed exposure so changing room light does not continuously move the detector thresholds."
+        )
+        self.sb_exposure.setToolTip(
+            "AR0234 exposure in 100-microsecond units. The GUI caps it at 160 (16 ms) to preserve 60 FPS; "
+            "lower values reduce motion blur and ambient light. Start at 100 and tune on the Jetson."
+        )
+        self.sb_camera_gain.setToolTip(
+            "Sensor gain. Keep near 1 when possible; higher gain brightens the dot but also amplifies image noise."
+        )
+        self.chk_auto_wb.setToolTip(
+            "Automatic white balance can change red-dot color while tracking. Leave off for repeatable HSV detection."
+        )
+        self.sb_wb_temp.setToolTip(
+            "Fixed white-balance temperature used while automatic white balance is off."
+        )
+        self.chk_low_latency.setToolTip(
+            "Enable the Jetson camera driver's low-latency capture mode."
+        )
 
         self.chk_servos.setToolTip("If unchecked, tracking can run and display, but servos will never move.")
         self.btn_start.setToolTip("Enable tracking & torque on (servos will follow dot).")
@@ -1350,10 +1931,13 @@ class MainWindow(QtWidgets.QMainWindow):
             calib_path=self.calib_path
         )
         self.worker.error_signal.connect(self.on_error)
+        self.worker.status_signal.connect(self.on_status)
         self.worker.start()
         self.worker.request_preview()
 
     def on_start_tracking(self):
+        if self.worker is not None:
+            self.worker.clear_servo_fault()
         self.store.set_attr("tracking_enabled", True)
 
     def on_stop_tracking(self):
@@ -1365,6 +1949,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_error(self, msg: str):
         self.preview_timer.stop()
         self.lbl_status.setText(f"ERROR: {msg}")
+
+    def on_status(self, msg: str):
+        self.lbl_status.setText(f"Status: {msg}")
 
     def poll_preview(self):
         if self.worker is None:
@@ -1406,7 +1993,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self.worker is not None:
                 self.worker.stop()
-                self.worker.wait(1500)
+                if not self.worker.wait(10000):
+                    self.lbl_status.setText(
+                        "Status: waiting for camera/control threads to stop safely"
+                    )
+                    event.ignore()
+                    return
         except Exception:
             pass
         event.accept()

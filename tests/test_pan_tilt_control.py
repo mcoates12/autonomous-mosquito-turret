@@ -19,7 +19,14 @@ except ModuleNotFoundError:
     sdk_stub.PortHandler = object
     sys.modules["dynamixel_sdk"] = sdk_stub
 
-from pan_tilt_control import FixedRatePanTiltController
+from pan_tilt_control import (
+    ADDR_MAX_POSITION_LIMIT,
+    ADDR_MIN_POSITION_LIMIT,
+    APPLICATION_TILT_MIN_TICKS,
+    DynamixelPanTilt,
+    FixedRatePanTiltController,
+    ServoHealth,
+)
 from tracking_core import ControlTarget
 
 
@@ -54,6 +61,8 @@ class FakeTurret:
         self.pan_velocity = 0.0
         self.tilt_velocity = 0.0
         self.torque = False
+        self.pan_health = ServoHealth()
+        self.tilt_health = ServoHealth()
         self.move_event = threading.Event()
         self.torque_off_event = threading.Event()
         self.last_profile = None
@@ -68,6 +77,9 @@ class FakeTurret:
 
     def set_motion_profile(self, velocity, acceleration):
         self.last_profile = (velocity, acceleration)
+
+    def read_health(self):
+        return self.pan_health, self.tilt_health
 
     def send(self, pan, tilt):
         moved = pan != self.pan_cmd or tilt != self.tilt_cmd
@@ -120,6 +132,48 @@ class FixedRateControllerTests(unittest.TestCase):
         finally:
             controller.stop()
 
+    def test_hardware_error_torques_off_and_latches_controller_error(self):
+        turret = FakeTurret()
+        turret.pan_health = ServoHealth(hardware_error=0x20)
+        store = FakeStore()
+        controller = FixedRatePanTiltController(turret, store)
+        controller.start()
+        try:
+            self.assertTrue(turret.torque_off_event.wait(0.5))
+            deadline = time.monotonic() + 0.5
+            while controller.snapshot().error is None and time.monotonic() < deadline:
+                time.sleep(0.005)
+            snapshot = controller.snapshot()
+            self.assertIsNotNone(snapshot.error)
+            self.assertIn("hardware error", snapshot.error)
+            self.assertFalse(snapshot.torque_enabled)
+        finally:
+            controller.stop()
+
+
+class ConfiguredLimitTests(unittest.TestCase):
+    def test_tilt_uses_conservative_application_minimum(self):
+        turret = object.__new__(DynamixelPanTilt)
+        turret.pan_id = 1
+        turret.tilt_id = 2
+        turret.position_limits_ticks = {1: (0, 4095), 2: (0, 4095)}
+        turret.configured_position_limits_ticks = dict(turret.position_limits_ticks)
+
+        values = {
+            (1, ADDR_MIN_POSITION_LIMIT): 0,
+            (1, ADDR_MAX_POSITION_LIMIT): 4095,
+            (2, ADDR_MIN_POSITION_LIMIT): 0,
+            (2, ADDR_MAX_POSITION_LIMIT): 2190,
+        }
+        turret._read4 = lambda servo_id, address, what: values[(servo_id, address)]
+
+        turret._read_configured_limits()
+
+        self.assertEqual(turret.position_limits_ticks[1], (0, 4095))
+        self.assertEqual(
+            turret.position_limits_ticks[2],
+            (APPLICATION_TILT_MIN_TICKS, 2190),
+        )
 
 if __name__ == "__main__":
     unittest.main()

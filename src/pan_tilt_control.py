@@ -27,21 +27,27 @@ ADDR_OPERATING_MODE = 11
 ADDR_MAX_POSITION_LIMIT = 48
 ADDR_MIN_POSITION_LIMIT = 52
 ADDR_TORQUE_ENABLE = 64
+ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_BUS_WATCHDOG = 98
 ADDR_PROFILE_ACCELERATION = 108
 ADDR_PROFILE_VELOCITY = 112
 ADDR_GOAL_POSITION = 116
+ADDR_PRESENT_LOAD = 126
 ADDR_PRESENT_VELOCITY = 128
 ADDR_PRESENT_POSITION = 132
+ADDR_PRESENT_INPUT_VOLTAGE = 144
+ADDR_PRESENT_TEMPERATURE = 146
 
 LEN_GOAL_POSITION = 4
 LEN_PRESENT_STATE = 8
+LEN_PRESENT_HEALTH = 21
 
 OPERATING_MODE_POSITION = 3
 TORQUE_ON, TORQUE_OFF = 1, 0
 
 DXL_VELOCITY_UNIT_DEG_S = 0.229 * 6.0
 BUS_WATCHDOG_TICKS = 25  # 25 * 20 ms = 500 ms
+APPLICATION_TILT_MIN_TICKS = 708  # Temporary 62.23-degree mechanical guard.
 
 
 class ControlParams(Protocol):
@@ -65,6 +71,14 @@ class ParamProvider(Protocol):
 
 def int_to_le_bytes(value: int, length: int) -> bytes:
     return int(value).to_bytes(length, byteorder="little", signed=False)
+
+
+@dataclass(frozen=True)
+class ServoHealth:
+    load_percent: float = 0.0
+    input_voltage: float = 0.0
+    temperature_c: int = 0
+    hardware_error: int = 0
 
 
 class DynamixelPanTilt:
@@ -91,10 +105,20 @@ class DynamixelPanTilt:
             ADDR_PRESENT_VELOCITY,
             LEN_PRESENT_STATE,
         )
+        self.sync_read_health = GroupSyncRead(
+            self.port_handler,
+            self.packet_handler,
+            ADDR_PRESENT_LOAD,
+            LEN_PRESENT_HEALTH,
+        )
         if not self.sync_read_state.addParam(self.pan_id):
             raise RuntimeError(f"Failed to add pan ID {self.pan_id} to sync read")
         if not self.sync_read_state.addParam(self.tilt_id):
             raise RuntimeError(f"Failed to add tilt ID {self.tilt_id} to sync read")
+        if not self.sync_read_health.addParam(self.pan_id):
+            raise RuntimeError(f"Failed to add pan ID {self.pan_id} to health read")
+        if not self.sync_read_health.addParam(self.tilt_id):
+            raise RuntimeError(f"Failed to add tilt ID {self.tilt_id} to health read")
 
         # Populated from the control table after open(). Dynamixel Wizard is
         # authoritative; this application does not duplicate its limits.
@@ -102,6 +126,7 @@ class DynamixelPanTilt:
             self.pan_id: (0, 4095),
             self.tilt_id: (0, 4095),
         }
+        self.configured_position_limits_ticks = dict(self.position_limits_ticks)
         self.pan_min, self.pan_max = 0.0, 360.0
         self.tilt_min, self.tilt_max = 0.0, 360.0
         self.pan_cmd = 0.0
@@ -110,6 +135,8 @@ class DynamixelPanTilt:
         self.tilt_actual = 0.0
         self.pan_velocity = 0.0
         self.tilt_velocity = 0.0
+        self.pan_health = ServoHealth()
+        self.tilt_health = ServoHealth()
 
         self.opened = False
         self.torque = False
@@ -151,6 +178,17 @@ class DynamixelPanTilt:
 
             self._read_configured_limits()
             self.read_feedback()
+            if not (self.pan_min <= self.pan_actual <= self.pan_max):
+                raise RuntimeError(
+                    f"pan position {self.pan_actual:.2f} deg is outside safe limits "
+                    f"{self.pan_min:.2f}..{self.pan_max:.2f} deg"
+                )
+            if not (self.tilt_min <= self.tilt_actual <= self.tilt_max):
+                raise RuntimeError(
+                    f"tilt position {self.tilt_actual:.2f} deg is outside safe limits "
+                    f"{self.tilt_min:.2f}..{self.tilt_max:.2f} deg; move it into "
+                    "range with torque off before arming"
+                )
             self.pan_cmd = self.pan_actual
             self.tilt_cmd = self.tilt_actual
         except Exception:
@@ -175,6 +213,13 @@ class DynamixelPanTilt:
         self._check(servo_id, comm, err, what)
         return int(value)
 
+    def _read1(self, servo_id: int, address: int, what: str) -> int:
+        value, comm, err = self.packet_handler.read1ByteTxRx(
+            self.port_handler, servo_id, address
+        )
+        self._check(servo_id, comm, err, what)
+        return int(value)
+
     def _read_configured_limits(self) -> None:
         for servo_id in (self.pan_id, self.tilt_id):
             maximum = self._read4(
@@ -187,6 +232,14 @@ class DynamixelPanTilt:
                 raise RuntimeError(
                     f"[ID:{servo_id}] invalid configured position limits: "
                     f"{minimum}..{maximum}"
+                )
+            self.configured_position_limits_ticks[servo_id] = (minimum, maximum)
+            if servo_id == self.tilt_id:
+                minimum = max(minimum, APPLICATION_TILT_MIN_TICKS)
+            if minimum > maximum:
+                raise RuntimeError(
+                    f"[ID:{servo_id}] configured maximum {maximum} is below "
+                    f"the application safety minimum {minimum}"
                 )
             self.position_limits_ticks[servo_id] = (minimum, maximum)
 
@@ -309,6 +362,49 @@ class DynamixelPanTilt:
             self.tilt_velocity,
         )
 
+    def read_health(self) -> Tuple[ServoHealth, ServoHealth]:
+        comm = self.sync_read_health.txRxPacket()
+        if comm != 0:
+            raise RuntimeError(
+                f"health sync_read COMM FAIL: "
+                f"{self.packet_handler.getTxRxResult(comm)}"
+            )
+
+        health = []
+        for servo_id in (self.pan_id, self.tilt_id):
+            if not self.sync_read_health.isAvailable(
+                servo_id, ADDR_PRESENT_LOAD, LEN_PRESENT_HEALTH
+            ):
+                raise RuntimeError(f"[ID:{servo_id}] health telemetry unavailable")
+            raw_load = self.sync_read_health.getData(
+                servo_id, ADDR_PRESENT_LOAD, 2
+            )
+            raw_voltage = self.sync_read_health.getData(
+                servo_id, ADDR_PRESENT_INPUT_VOLTAGE, 2
+            )
+            raw_temperature = self.sync_read_health.getData(
+                servo_id, ADDR_PRESENT_TEMPERATURE, 1
+            )
+            hardware_error = self._read1(
+                servo_id,
+                ADDR_HARDWARE_ERROR_STATUS,
+                "read hardware error status",
+            )
+            signed_load = int(raw_load)
+            if signed_load & (1 << 15):
+                signed_load -= 1 << 16
+            health.append(
+                ServoHealth(
+                    load_percent=signed_load * 0.1,
+                    input_voltage=int(raw_voltage) * 0.1,
+                    temperature_c=int(raw_temperature),
+                    hardware_error=hardware_error,
+                )
+            )
+
+        self.pan_health, self.tilt_health = health
+        return self.pan_health, self.tilt_health
+
     def _bounded_ticks(self, servo_id: int, degrees: float) -> int:
         ticks = degrees_to_position_ticks(degrees)
         minimum, maximum = self.position_limits_ticks[servo_id]
@@ -349,6 +445,18 @@ class ControllerSnapshot:
     torque_enabled: bool
     move_updates: int
     target_age_s: Optional[float] = None
+    controller_rate_hz: float = 0.0
+    deadline_misses: int = 0
+    feedback_read_ms: float = 0.0
+    command_write_ms: float = 0.0
+    pan_load_percent: float = 0.0
+    tilt_load_percent: float = 0.0
+    pan_voltage: float = 0.0
+    tilt_voltage: float = 0.0
+    pan_temperature_c: int = 0
+    tilt_temperature_c: int = 0
+    pan_hardware_error: int = 0
+    tilt_hardware_error: int = 0
     error: Optional[str] = None
 
 
@@ -357,7 +465,9 @@ class FixedRatePanTiltController:
 
     TARGET_STALE_SEC = 0.25
     INACTIVE_FEEDBACK_PERIOD_SEC = 0.10
+    HEALTH_PERIOD_SEC = 0.50
     MIN_MAX_CONTROL_DT_SEC = 0.05
+    TIMING_EMA_ALPHA = 0.10
 
     def __init__(self, turret: DynamixelPanTilt, store: ParamProvider):
         self.turret = turret
@@ -367,6 +477,10 @@ class FixedRatePanTiltController:
         self._target = None
         self._move_updates = 0
         self._error = None
+        self._controller_rate_hz = 0.0
+        self._deadline_misses = 0
+        self._feedback_read_ms = 0.0
+        self._command_write_ms = 0.0
         self._snapshot = self._make_snapshot()
         self._thread = threading.Thread(
             target=self._run,
@@ -387,6 +501,18 @@ class FixedRatePanTiltController:
             torque_enabled=self.turret.torque,
             move_updates=self._move_updates,
             target_age_s=target_age_s,
+            controller_rate_hz=self._controller_rate_hz,
+            deadline_misses=self._deadline_misses,
+            feedback_read_ms=self._feedback_read_ms,
+            command_write_ms=self._command_write_ms,
+            pan_load_percent=self.turret.pan_health.load_percent,
+            tilt_load_percent=self.turret.tilt_health.load_percent,
+            pan_voltage=self.turret.pan_health.input_voltage,
+            tilt_voltage=self.turret.tilt_health.input_voltage,
+            pan_temperature_c=self.turret.pan_health.temperature_c,
+            tilt_temperature_c=self.turret.tilt_health.temperature_c,
+            pan_hardware_error=self.turret.pan_health.hardware_error,
+            tilt_hardware_error=self.turret.tilt_health.hardware_error,
             error=self._error,
         )
 
@@ -396,6 +522,8 @@ class FixedRatePanTiltController:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=3.0)
+        if self._thread.is_alive():
+            raise RuntimeError("servo controller did not stop within 3 seconds")
 
     def publish_target(self, target: ControlTarget) -> None:
         with self._lock:
@@ -428,10 +556,33 @@ class FixedRatePanTiltController:
         self.turret.send(self.turret.pan_cmd, self.turret.tilt_cmd)
         self.turret.torque_on()
 
+    def _update_ema(self, current: float, sample: float) -> float:
+        if current <= 0.0:
+            return sample
+        alpha = self.TIMING_EMA_ALPHA
+        return (1.0 - alpha) * current + alpha * sample
+
+    def _timed_feedback_read(self) -> None:
+        started_at = time.perf_counter()
+        self.turret.read_feedback()
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self._feedback_read_ms = self._update_ema(
+            self._feedback_read_ms, elapsed_ms
+        )
+
+    def _timed_command(self, pan_deg: float, tilt_deg: float) -> None:
+        started_at = time.perf_counter()
+        self.turret.send(pan_deg, tilt_deg)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self._command_write_ms = self._update_ema(
+            self._command_write_ms, elapsed_ms
+        )
+
     def _run(self) -> None:
         last_tick = time.monotonic()
         next_tick = last_tick
         next_inactive_feedback = last_tick
+        next_health_read = last_tick
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
@@ -441,8 +592,15 @@ class FixedRatePanTiltController:
 
                 params = self.store.get()
                 period = 1.0 / clamp(params.rate_hz, 5.0, 120.0)
+                lateness = max(0.0, now - next_tick)
+                if lateness > period * 0.5:
+                    self._deadline_misses += 1
                 max_dt = max(self.MIN_MAX_CONTROL_DT_SEC, 2.0 * period)
                 dt = clamp(now - last_tick, 0.0, max_dt)
+                if dt >= period * 0.25:
+                    self._controller_rate_hz = self._update_ema(
+                        self._controller_rate_hz, 1.0 / dt
+                    )
                 last_tick = now
                 next_tick += period
                 if next_tick <= now:
@@ -460,7 +618,7 @@ class FixedRatePanTiltController:
                             params.profile_acceleration,
                         )
 
-                    self.turret.read_feedback()
+                    self._timed_feedback_read()
                     target = self._latest_target()
                     if target is not None:
                         target_age = max(0.0, now - target.timestamp)
@@ -493,7 +651,7 @@ class FixedRatePanTiltController:
                             params.max_step_deg,
                         )
                         if delta_pan != 0.0 or delta_tilt != 0.0:
-                            self.turret.send(
+                            self._timed_command(
                                 self.turret.pan_cmd + delta_pan,
                                 self.turret.tilt_cmd + delta_tilt,
                             )
@@ -502,11 +660,21 @@ class FixedRatePanTiltController:
                     if self.turret.torque:
                         self.turret.torque_off(best_effort=False)
                     if now >= next_inactive_feedback:
-                        self.turret.read_feedback()
+                        self._timed_feedback_read()
                         self.turret.pan_cmd = self.turret.pan_actual
                         self.turret.tilt_cmd = self.turret.tilt_actual
                         next_inactive_feedback = (
                             now + self.INACTIVE_FEEDBACK_PERIOD_SEC
+                        )
+
+                if now >= next_health_read:
+                    pan_health, tilt_health = self.turret.read_health()
+                    next_health_read = now + self.HEALTH_PERIOD_SEC
+                    if pan_health.hardware_error or tilt_health.hardware_error:
+                        raise RuntimeError(
+                            "Dynamixel hardware error: "
+                            f"pan=0x{pan_health.hardware_error:02x} "
+                            f"tilt=0x{tilt_health.hardware_error:02x}"
                         )
 
                 self._publish_snapshot(target_age)
