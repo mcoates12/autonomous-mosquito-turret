@@ -327,13 +327,14 @@ class LiveParams:
     track_source: str = "Left"      # Left | Right
 
     v_thresh: int = 80
-    s_thresh: int = 60
+    s_thresh: int = 35
     min_area: float = 1.0
     max_area: float = 2000
 
     # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
     local_contrast_gate: int = 25  # peak V above nearby background
+    local_red_contrast_gate: int = 6  # red excess above nearby wall
     laser_edge_margin_px: int = 48  # ignore incomplete targets at frame edge
     area_hi_gate: float = 40.0    # reject huge blobs
     smoothing_tau_ms: float = 60.0
@@ -489,7 +490,7 @@ class TargetDetector(Protocol):
 
 
 # -----------------------------
-# Red laser detection (HSV)
+# Red laser detection (HSV + local chroma)
 # -----------------------------
 LASER_MORPH_KERNEL = np.ones((3, 3), np.uint8)
 
@@ -500,11 +501,13 @@ def find_laser_target_red(
     frame_timestamp: Optional[float] = None,
     frame_origin: Tuple[int, int] = (0, 0),
     full_frame_shape: Optional[Tuple[int, int]] = None,
+    expected_position: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Optional[TargetObservation], np.ndarray]:
     """
     Red-laser dot detection:
     - HSV threshold for red (two hue ranges)
-    - Allows low saturation (important at distance on walls)
+    - Local brightness and red-chroma contrast against the nearby wall
+    - Temporal proximity preference while an existing track is active
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     v = hsv[:, :, 2]
@@ -532,7 +535,7 @@ def find_laser_target_red(
     if not contours:
         return None, mask
 
-    best, best_score = None, -1.0
+    best, best_score = None, float("-inf")
     origin_x, origin_y = frame_origin
     if full_frame_shape is None:
         frame_height, frame_width = v.shape
@@ -587,7 +590,50 @@ def find_laser_target_red(
         if local_contrast < float(p.local_contrast_gate):
             continue
 
-        score = 2.0 * local_contrast + 0.25 * peak_v - 0.03 * area
+        # Compute chroma only in these tiny candidate/local patches. A
+        # full-frame signed conversion here would add several large memory
+        # allocations to every 60 FPS detection pass.
+        roi_bgr = frame_bgr[y:y+h2, x:x+w]
+        candidate_bgr = roi_bgr[roi_threshold != 0].astype(np.int16)
+        candidate_red_signal = (
+            candidate_bgr[:, 2]
+            - (candidate_bgr[:, 1] + candidate_bgr[:, 0]) // 2
+        )
+        peak_red_signal = float(np.max(candidate_red_signal))
+        local_bgr = frame_bgr[
+            local_y1:local_y2,
+            local_x1:local_x2,
+        ].astype(np.int16)
+        local_red_signal = (
+            local_bgr[:, :, 2]
+            - (local_bgr[:, :, 1] + local_bgr[:, :, 0]) // 2
+        )
+        local_background_red = float(
+            np.median(local_red_signal)
+        )
+        local_red_contrast = peak_red_signal - local_background_red
+        if local_red_contrast < float(p.local_red_contrast_gate):
+            continue
+
+        score = (
+            2.0 * local_contrast
+            + 3.0 * local_red_contrast
+            + 0.25 * peak_v
+            - 0.03 * area
+        )
+        if expected_position is not None:
+            candidate_x = global_x + 0.5 * w
+            candidate_y = global_y + 0.5 * h2
+            distance = float(
+                np.hypot(
+                    candidate_x - expected_position[0],
+                    candidate_y - expected_position[1],
+                )
+            )
+            # Within the tracking ROI, prefer continuity over a slightly
+            # brighter distractor. Fast real motion remains possible; after
+            # three misses the detector performs an unbiased full reacquire.
+            score -= 0.5 * distance
         if score > best_score:
             best_score = score
             best = c
@@ -648,10 +694,11 @@ class RedLaserDetector:
     ) -> Tuple[Optional[TargetObservation], np.ndarray]:
         height, width = frame_bgr.shape[:2]
         x1, y1, x2, y2 = 0, 0, width, height
-        if (
+        using_tracking_roi = (
             self._last_x is not None
             and self._misses < self.FULL_SEARCH_AFTER_MISSES
-        ):
+        )
+        if using_tracking_roi:
             base_half_size = max(32, int(params.laser_roi_half_size))
             half_size = base_half_size * (2 ** self._misses)
             center_x = int(round(self._last_x))
@@ -667,6 +714,11 @@ class RedLaserDetector:
             frame_timestamp,
             frame_origin=(x1, y1),
             full_frame_shape=(height, width),
+            expected_position=(
+                (self._last_x, self._last_y)
+                if using_tracking_roi
+                else None
+            ),
         )
         if target is None:
             self._misses += 1
@@ -1852,6 +1904,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_local_contrast_gate = integer(
             0, 255, p.local_contrast_gate
         )
+        self.sb_local_red_contrast_gate = integer(
+            0, 255, p.local_red_contrast_gate
+        )
         self.sb_laser_edge_margin = integer(
             0, 480, p.laser_edge_margin_px
         )
@@ -1902,6 +1957,9 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(QtWidgets.QLabel("— Confidence Gates —"), QtWidgets.QLabel(""))
         form.addRow("peak_v_gate", self.sb_peak_gate)
         form.addRow("local_contrast_gate", self.sb_local_contrast_gate)
+        form.addRow(
+            "local_red_contrast_gate", self.sb_local_red_contrast_gate
+        )
         form.addRow("laser_edge_margin_px", self.sb_laser_edge_margin)
         form.addRow("area_hi_gate", self.sb_area_hi_gate)
         form.addRow("smoothing_tau_ms", self.sb_smoothing_tau)
@@ -1956,6 +2014,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_peak_gate.valueChanged.connect(lambda v: self.store.set_attr("peak_v_gate", int(v)))
         self.sb_local_contrast_gate.valueChanged.connect(
             lambda v: self.store.set_attr("local_contrast_gate", int(v))
+        )
+        self.sb_local_red_contrast_gate.valueChanged.connect(
+            lambda v: self.store.set_attr(
+                "local_red_contrast_gate", int(v)
+            )
         )
         self.sb_laser_edge_margin.valueChanged.connect(
             lambda v: self.store.set_attr("laser_edge_margin_px", int(v))
@@ -2024,6 +2087,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_local_contrast_gate.setToolTip(
             "Require the candidate peak to be this much brighter than its "
             "local background. Raise it to reject broad reddish objects."
+        )
+        self.sb_local_red_contrast_gate.setToolTip(
+            "Require the candidate to be redder than the nearby wall by this "
+            "amount. This adapts to bright and dark wall regions."
         )
         self.sb_laser_edge_margin.setToolTip(
             "Ignore detections this many source-image pixels from an edge. "
