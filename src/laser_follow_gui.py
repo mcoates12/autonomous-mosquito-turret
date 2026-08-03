@@ -334,6 +334,7 @@ class LiveParams:
     # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
     local_contrast_gate: int = 25  # peak V above nearby background
+    laser_edge_margin_px: int = 48  # ignore incomplete targets at frame edge
     area_hi_gate: float = 40.0    # reject huge blobs
     smoothing_tau_ms: float = 60.0
     lock_time_ms: float = 50.0
@@ -497,6 +498,8 @@ def find_laser_target_red(
     frame_bgr: np.ndarray,
     p: LiveParams,
     frame_timestamp: Optional[float] = None,
+    frame_origin: Tuple[int, int] = (0, 0),
+    full_frame_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Optional[TargetObservation], np.ndarray]:
     """
     Red-laser dot detection:
@@ -530,6 +533,12 @@ def find_laser_target_red(
         return None, mask
 
     best, best_score = None, -1.0
+    origin_x, origin_y = frame_origin
+    if full_frame_shape is None:
+        frame_height, frame_width = v.shape
+    else:
+        frame_height, frame_width = full_frame_shape
+    edge_margin = max(0, int(p.laser_edge_margin_px))
     for c in contours:
         area = cv2.contourArea(c)
         if (
@@ -539,6 +548,21 @@ def find_laser_target_red(
         ):
             continue
         x, y, w, h2 = cv2.boundingRect(c)
+
+        # Candidates clipped by a frame edge do not have a complete shape or
+        # a reliable local background. They also commonly fall outside the
+        # valid stereo-rectification area. Reject this strip before scoring so
+        # a bright cardboard edge cannot steal lock from an interior laser dot.
+        global_x = x + origin_x
+        global_y = y + origin_y
+        if (
+            global_x < edge_margin
+            or global_y < edge_margin
+            or global_x + w > frame_width - edge_margin
+            or global_y + h2 > frame_height - edge_margin
+        ):
+            continue
+
         roi_v = v[y:y+h2, x:x+w]
         roi_threshold = threshold_mask[y:y+h2, x:x+w]
         candidate_v = roi_v[roi_threshold != 0]
@@ -638,7 +662,11 @@ class RedLaserDetector:
             y2 = min(height, center_y + half_size)
 
         target, mask = find_laser_target_red(
-            frame_bgr[y1:y2, x1:x2], params, frame_timestamp
+            frame_bgr[y1:y2, x1:x2],
+            params,
+            frame_timestamp,
+            frame_origin=(x1, y1),
+            full_frame_shape=(height, width),
         )
         if target is None:
             self._misses += 1
@@ -1824,6 +1852,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_local_contrast_gate = integer(
             0, 255, p.local_contrast_gate
         )
+        self.sb_laser_edge_margin = integer(
+            0, 480, p.laser_edge_margin_px
+        )
         self.sb_area_hi_gate = dbl(1.0, 5000.0, 10.0, p.area_hi_gate)
         self.sb_smoothing_tau = dbl(5.0, 500.0, 5.0, p.smoothing_tau_ms)
         self.sb_lock_time = dbl(0.0, 1000.0, 10.0, p.lock_time_ms)
@@ -1871,6 +1902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(QtWidgets.QLabel("— Confidence Gates —"), QtWidgets.QLabel(""))
         form.addRow("peak_v_gate", self.sb_peak_gate)
         form.addRow("local_contrast_gate", self.sb_local_contrast_gate)
+        form.addRow("laser_edge_margin_px", self.sb_laser_edge_margin)
         form.addRow("area_hi_gate", self.sb_area_hi_gate)
         form.addRow("smoothing_tau_ms", self.sb_smoothing_tau)
         form.addRow("lock_time_ms", self.sb_lock_time)
@@ -1924,6 +1956,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_peak_gate.valueChanged.connect(lambda v: self.store.set_attr("peak_v_gate", int(v)))
         self.sb_local_contrast_gate.valueChanged.connect(
             lambda v: self.store.set_attr("local_contrast_gate", int(v))
+        )
+        self.sb_laser_edge_margin.valueChanged.connect(
+            lambda v: self.store.set_attr("laser_edge_margin_px", int(v))
         )
         self.sb_area_hi_gate.valueChanged.connect(lambda v: self.store.set_attr("area_hi_gate", float(v)))
         self.sb_smoothing_tau.valueChanged.connect(
@@ -1989,6 +2024,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_local_contrast_gate.setToolTip(
             "Require the candidate peak to be this much brighter than its "
             "local background. Raise it to reject broad reddish objects."
+        )
+        self.sb_laser_edge_margin.setToolTip(
+            "Ignore detections this many source-image pixels from an edge. "
+            "Edge-clipped targets are unreliable and may be outside the "
+            "valid rectified stereo image."
         )
         self.sb_area_hi_gate.setToolTip("Hard gate: reject any detection larger than this area even if it is red. Helps with big red patches.")
         self.sb_smoothing_tau.setToolTip(

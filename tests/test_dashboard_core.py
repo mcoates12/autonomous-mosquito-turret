@@ -22,6 +22,7 @@ class ParameterValidationTests(unittest.TestCase):
     def test_normalizes_float_and_accepts_valid_choice(self):
         self.assertEqual(coerce_parameter("smoothing_tau_ms", 60), 60.0)
         self.assertEqual(coerce_parameter("track_source", "Right"), "Right")
+        self.assertEqual(coerce_parameter("laser_edge_margin_px", 48), 48)
 
     def test_rejects_unknown_wrong_type_and_out_of_range(self):
         with self.assertRaisesRegex(ValueError, "unknown parameter"):
@@ -32,6 +33,8 @@ class ParameterValidationTests(unittest.TestCase):
             coerce_parameter("exposure_time_absolute", 312)
         with self.assertRaisesRegex(ValueError, "at most 255"):
             coerce_parameter("local_contrast_gate", 256)
+        with self.assertRaisesRegex(ValueError, "at most 480"):
+            coerce_parameter("laser_edge_margin_px", 481)
 
     def test_validates_entire_request_before_mutating_store(self):
         store = FakeStore()
