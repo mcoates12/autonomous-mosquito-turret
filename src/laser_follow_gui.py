@@ -121,7 +121,7 @@ class Stats:
         )
         if controller_state is not None:
             logger.info(
-                "control hz=%.1f misses=%d io_ms(read=%.2f write=%.2f) "
+                "control hz=%.1f misses=%d io_ms(read=%.2f write=%.2f health=%.2f) "
                 "error_deg(pan=%.2f tilt=%.2f) "
                 "error_rate_px_s(pan=%.1f tilt=%.1f) "
                 "health(load=%.1f/%.1f%% voltage=%.1f/%.1fV temp=%d/%dC hw=0x%02x/0x%02x) "
@@ -130,6 +130,7 @@ class Stats:
                 controller_state.deadline_misses,
                 controller_state.feedback_read_ms,
                 controller_state.command_write_ms,
+                controller_state.health_read_ms,
                 controller_state.pan_command_deg - controller_state.pan_actual_deg,
                 controller_state.tilt_command_deg - controller_state.tilt_actual_deg,
                 controller_state.pan_error_rate_px_s,

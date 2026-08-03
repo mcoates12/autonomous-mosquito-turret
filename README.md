@@ -103,6 +103,12 @@ gain `0.003`, pan damping `0.006`, tilt damping `0.003`, smoothing `35 ms`, and
 maximum step `0.60 deg`. Raise damping gradually to reduce single-pass
 overshoot; excessive damping can produce twitch or hesitation.
 
+Servo goal commands remain at the selected controller rate (60 Hz by default),
+while position/velocity feedback runs at 30 Hz and full health telemetry at
+1 Hz. Hardware-error bytes are checked against the XL430's defined `0x3D` bit
+mask; impossible reserved-bit values are retried and persistent invalid reads
+still trigger the torque-off safety latch.
+
 The runtime prefers the Jetson `nvv4l2camerasrc`/`nvvidconv` VIC conversion
 path and automatically falls back to the portable software pipeline if it is
 unavailable. In the preview overlay, `FPS` is the processed tracking rate and

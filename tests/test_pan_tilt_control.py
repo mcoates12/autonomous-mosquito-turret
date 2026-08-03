@@ -27,6 +27,7 @@ from pan_tilt_control import (
     DynamixelPanTilt,
     DynamixelCommunicationError,
     FixedRatePanTiltController,
+    HARDWARE_ERROR_VALID_MASK,
     ServoHealth,
 )
 from tracking_core import ControlTarget
@@ -71,8 +72,12 @@ class FakeTurret:
         self.torque_off_event = threading.Event()
         self.last_profile = None
         self.feedback_error = None
+        self.feedback_calls = 0
+        self.health_calls = 0
+        self.send_calls = 0
 
     def read_feedback(self):
+        self.feedback_calls += 1
         if self.feedback_error is not None:
             raise self.feedback_error
         return (
@@ -86,9 +91,11 @@ class FakeTurret:
         self.last_profile = (velocity, acceleration)
 
     def read_health(self):
+        self.health_calls += 1
         return self.pan_health, self.tilt_health
 
     def send(self, pan, tilt):
+        self.send_calls += 1
         moved = pan != self.pan_cmd or tilt != self.tilt_cmd
         self.pan_cmd = pan
         self.tilt_cmd = tilt
@@ -104,6 +111,23 @@ class FakeTurret:
 
 
 class FixedRateControllerTests(unittest.TestCase):
+    def test_command_rate_is_decoupled_from_feedback_and_health_reads(self):
+        turret = FakeTurret()
+        store = FakeStore()
+        controller = FixedRatePanTiltController(turret, store)
+        controller.publish_target(
+            ControlTarget(100.0, 50.0, time.monotonic(), locked=True)
+        )
+        controller.start()
+        try:
+            self.assertTrue(turret.move_event.wait(0.5))
+            time.sleep(0.12)
+            self.assertGreater(turret.send_calls, turret.feedback_calls)
+            self.assertLessEqual(turret.feedback_calls, 8)
+            self.assertLessEqual(turret.health_calls, 2)
+        finally:
+            controller.stop()
+
     def test_controller_moves_latest_target_then_really_torques_off(self):
         turret = FakeTurret()
         store = FakeStore()
@@ -229,6 +253,54 @@ class ConfiguredLimitTests(unittest.TestCase):
         )
 
 
+class HealthReadTests(unittest.TestCase):
+    def test_health_sync_read_also_refreshes_position_and_velocity(self):
+        class FakeSyncRead:
+            @staticmethod
+            def txRxPacket():
+                return 0
+
+            @staticmethod
+            def isAvailable(servo_id, address, length):
+                return True
+
+            @staticmethod
+            def getData(servo_id, address, length):
+                values = {
+                    (1, 126): 100,
+                    (1, 128): 10,
+                    (1, 132): 2048,
+                    (1, 144): 120,
+                    (1, 146): 40,
+                    (2, 126): 0xFFFF,
+                    (2, 128): 0xFFFFFFF6,
+                    (2, 132): 1024,
+                    (2, 144): 119,
+                    (2, 146): 41,
+                }
+                return values[(servo_id, address)]
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.pan_id = 1
+        turret.tilt_id = 2
+        turret.sync_read_health = FakeSyncRead()
+        turret.packet_handler = types.SimpleNamespace(
+            getTxRxResult=lambda comm: "communication error"
+        )
+        turret._read1 = lambda *args, **kwargs: 0
+
+        pan_health, tilt_health = turret.read_health()
+
+        self.assertAlmostEqual(pan_health.load_percent, 10.0)
+        self.assertAlmostEqual(tilt_health.load_percent, -0.1)
+        self.assertAlmostEqual(pan_health.input_voltage, 12.0)
+        self.assertAlmostEqual(tilt_health.input_voltage, 11.9)
+        self.assertAlmostEqual(turret.pan_actual, 180.043956, places=5)
+        self.assertAlmostEqual(turret.tilt_actual, 90.021978, places=5)
+        self.assertGreater(turret.pan_velocity, 0.0)
+        self.assertLess(turret.tilt_velocity, 0.0)
+
+
 class SyncReadRetryTests(unittest.TestCase):
     def test_feedback_read_retries_one_missed_status_packet(self):
         class FakeSyncRead:
@@ -291,6 +363,7 @@ class SyncReadRetryTests(unittest.TestCase):
             1,
             ADDR_HARDWARE_ERROR_STATUS,
             "read hardware error status",
+            valid_mask=HARDWARE_ERROR_VALID_MASK,
         )
 
         self.assertEqual(value, 0x20)
@@ -321,6 +394,7 @@ class SyncReadRetryTests(unittest.TestCase):
                 1,
                 ADDR_HARDWARE_ERROR_STATUS,
                 "read hardware error status",
+                valid_mask=HARDWARE_ERROR_VALID_MASK,
             )
 
         self.assertEqual(turret.packet_handler.calls, 3)
@@ -347,8 +421,87 @@ class SyncReadRetryTests(unittest.TestCase):
                 1,
                 ADDR_HARDWARE_ERROR_STATUS,
                 "read hardware error status",
+                valid_mask=HARDWARE_ERROR_VALID_MASK,
             )
 
+        self.assertEqual(turret.packet_handler.calls, 1)
+
+    def test_hardware_status_read_retries_reserved_bits(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.results = [
+                    (0xF3, 0, 0),
+                    (0x13, 0, 0),
+                    (0x00, 0, 0),
+                ]
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                result = self.results[self.calls]
+                self.calls += 1
+                return result
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        value = turret._read1(
+            1,
+            ADDR_HARDWARE_ERROR_STATUS,
+            "read hardware error status",
+            valid_mask=HARDWARE_ERROR_VALID_MASK,
+        )
+
+        self.assertEqual(value, 0)
+        self.assertEqual(turret.packet_handler.calls, 3)
+
+    def test_hardware_status_read_rejects_persistent_reserved_bits(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                self.calls += 1
+                return 0xF3, 0, 0
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        with self.assertRaisesRegex(
+            DynamixelCommunicationError,
+            "reserved bits 0xc2 were set",
+        ):
+            turret._read1(
+                1,
+                ADDR_HARDWARE_ERROR_STATUS,
+                "read hardware error status",
+                valid_mask=HARDWARE_ERROR_VALID_MASK,
+            )
+
+        self.assertEqual(turret.packet_handler.calls, 3)
+
+    def test_hardware_status_read_accepts_real_error_bits(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                self.calls += 1
+                return 0x20, 0, 0
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        value = turret._read1(
+            1,
+            ADDR_HARDWARE_ERROR_STATUS,
+            "read hardware error status",
+            valid_mask=HARDWARE_ERROR_VALID_MASK,
+        )
+
+        self.assertEqual(value, 0x20)
         self.assertEqual(turret.packet_handler.calls, 1)
 
 if __name__ == "__main__":

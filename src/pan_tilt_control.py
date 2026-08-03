@@ -39,6 +39,11 @@ ADDR_PRESENT_POSITION = 132
 ADDR_PRESENT_INPUT_VOLTAGE = 144
 ADDR_PRESENT_TEMPERATURE = 146
 
+# XL430 Hardware Error Status(70): voltage, temperature, encoder, electrical
+# shock/insufficient power, and overload. Bits 1, 6, and 7 are reserved and
+# must always be zero.
+HARDWARE_ERROR_VALID_MASK = 0x3D
+
 LEN_GOAL_POSITION = 4
 LEN_PRESENT_STATE = 8
 LEN_PRESENT_HEALTH = 21
@@ -227,12 +232,19 @@ class DynamixelPanTilt:
         self._check(servo_id, comm, err, what)
         return int(value)
 
-    def _read1(self, servo_id: int, address: int, what: str) -> int:
+    def _read1(
+        self,
+        servo_id: int,
+        address: int,
+        what: str,
+        valid_mask: Optional[int] = None,
+    ) -> int:
         # A single malformed Protocol 2.0 status packet can occur while the
-        # half-duplex bus is busy. Retry only transport failures; a valid packet
-        # carrying a device error remains immediately fatal. Persistent
-        # transport failures still propagate to the controller's torque-off,
-        # operator-rearm safety latch.
+        # half-duplex bus is busy. Retry transport failures and, when a mask is
+        # supplied, impossible values with reserved bits set. A valid packet
+        # carrying a device error remains immediately fatal. Persistent bad
+        # reads still propagate to the controller's torque-off, operator-rearm
+        # safety latch.
         value = 0
         comm = 0
         err = 0
@@ -242,12 +254,24 @@ class DynamixelPanTilt:
             )
             if comm == 0:
                 self._check(servo_id, comm, err, what)
-                return int(value)
+                value = int(value)
+                invalid_bits = (
+                    0
+                    if valid_mask is None
+                    else value & (~int(valid_mask) & 0xFF)
+                )
+                if invalid_bits == 0:
+                    return value
             if attempt + 1 < STATUS_READ_ATTEMPTS:
                 time.sleep(STATUS_READ_RETRY_DELAY_SEC)
 
-        self._check(servo_id, comm, err, what)
-        raise AssertionError("unreachable")
+        if comm != 0:
+            self._check(servo_id, comm, err, what)
+            raise AssertionError("unreachable")
+        raise DynamixelCommunicationError(
+            f"[ID:{servo_id}] {what} invalid value 0x{value:02x}: "
+            f"reserved bits 0x{invalid_bits:02x} were set"
+        )
 
     def _read_configured_limits(self) -> None:
         for servo_id in (self.pan_id, self.tilt_id):
@@ -410,6 +434,7 @@ class DynamixelPanTilt:
             )
 
         health = []
+        states = []
         for servo_id in (self.pan_id, self.tilt_id):
             if not self.sync_read_health.isAvailable(
                 servo_id, ADDR_PRESENT_LOAD, LEN_PRESENT_HEALTH
@@ -419,6 +444,12 @@ class DynamixelPanTilt:
                 )
             raw_load = self.sync_read_health.getData(
                 servo_id, ADDR_PRESENT_LOAD, 2
+            )
+            raw_velocity = self.sync_read_health.getData(
+                servo_id, ADDR_PRESENT_VELOCITY, 4
+            )
+            raw_position = self.sync_read_health.getData(
+                servo_id, ADDR_PRESENT_POSITION, 4
             )
             raw_voltage = self.sync_read_health.getData(
                 servo_id, ADDR_PRESENT_INPUT_VOLTAGE, 2
@@ -430,10 +461,18 @@ class DynamixelPanTilt:
                 servo_id,
                 ADDR_HARDWARE_ERROR_STATUS,
                 "read hardware error status",
+                valid_mask=HARDWARE_ERROR_VALID_MASK,
             )
             signed_load = int(raw_load)
             if signed_load & (1 << 15):
                 signed_load -= 1 << 16
+            states.append(
+                (
+                    position_ticks_to_degrees(int(raw_position)),
+                    self._signed32(int(raw_velocity))
+                    * DXL_VELOCITY_UNIT_DEG_S,
+                )
+            )
             health.append(
                 ServoHealth(
                     load_percent=signed_load * 0.1,
@@ -444,6 +483,8 @@ class DynamixelPanTilt:
             )
 
         self.pan_health, self.tilt_health = health
+        self.pan_actual, self.pan_velocity = states[0]
+        self.tilt_actual, self.tilt_velocity = states[1]
         return self.pan_health, self.tilt_health
 
     def _bounded_ticks(self, servo_id: int, degrees: float) -> int:
@@ -490,6 +531,7 @@ class ControllerSnapshot:
     deadline_misses: int = 0
     feedback_read_ms: float = 0.0
     command_write_ms: float = 0.0
+    health_read_ms: float = 0.0
     pan_error_rate_px_s: float = 0.0
     tilt_error_rate_px_s: float = 0.0
     pan_load_percent: float = 0.0
@@ -508,8 +550,9 @@ class FixedRatePanTiltController:
     """Own the servo bus and consume only the most recent target error."""
 
     TARGET_STALE_SEC = 0.25
+    ACTIVE_FEEDBACK_PERIOD_SEC = 1.0 / 30.0
     INACTIVE_FEEDBACK_PERIOD_SEC = 0.10
-    HEALTH_PERIOD_SEC = 0.50
+    HEALTH_PERIOD_SEC = 1.0
     MIN_MAX_CONTROL_DT_SEC = 0.05
     TIMING_EMA_ALPHA = 0.10
     ERROR_RATE_FILTER_TAU_SEC = 0.05
@@ -527,6 +570,7 @@ class FixedRatePanTiltController:
         self._deadline_misses = 0
         self._feedback_read_ms = 0.0
         self._command_write_ms = 0.0
+        self._health_read_ms = 0.0
         self._pan_error_rate = FilteredDerivative(
             self.ERROR_RATE_FILTER_TAU_SEC,
             self.TARGET_STALE_SEC,
@@ -561,6 +605,7 @@ class FixedRatePanTiltController:
             deadline_misses=self._deadline_misses,
             feedback_read_ms=self._feedback_read_ms,
             command_write_ms=self._command_write_ms,
+            health_read_ms=self._health_read_ms,
             pan_error_rate_px_s=self._pan_error_rate_px_s,
             tilt_error_rate_px_s=self._tilt_error_rate_px_s,
             pan_load_percent=self.turret.pan_health.load_percent,
@@ -637,6 +682,15 @@ class FixedRatePanTiltController:
             self._command_write_ms, elapsed_ms
         )
 
+    def _timed_health_read(self) -> Tuple[ServoHealth, ServoHealth]:
+        started_at = time.perf_counter()
+        health = self.turret.read_health()
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self._health_read_ms = self._update_ema(
+            self._health_read_ms, elapsed_ms
+        )
+        return health
+
     def _reset_error_rates(self) -> None:
         self._pan_error_rate.reset()
         self._tilt_error_rate.reset()
@@ -646,6 +700,7 @@ class FixedRatePanTiltController:
     def _run(self) -> None:
         last_tick = time.monotonic()
         next_tick = last_tick
+        next_active_feedback = last_tick
         next_inactive_feedback = last_tick
         next_health_read = last_tick
         active = False
@@ -674,17 +729,31 @@ class FixedRatePanTiltController:
 
                 active = params.tracking_enabled and params.servos_enabled
                 target_age = None
+                health_due = now >= next_health_read
 
                 if active:
+                    just_armed = False
                     if not self.turret.torque:
                         self._arm_without_jump(params)
+                        just_armed = True
+                        next_active_feedback = (
+                            now + self.ACTIVE_FEEDBACK_PERIOD_SEC
+                        )
                     else:
                         self.turret.set_motion_profile(
                             params.profile_velocity,
                             params.profile_acceleration,
                         )
 
-                    self._timed_feedback_read()
+                    if (
+                        not just_armed
+                        and not health_due
+                        and now >= next_active_feedback
+                    ):
+                        self._timed_feedback_read()
+                        next_active_feedback = (
+                            now + self.ACTIVE_FEEDBACK_PERIOD_SEC
+                        )
                     target = self._latest_target()
                     if target is not None:
                         target_age = max(0.0, now - target.timestamp)
@@ -742,7 +811,7 @@ class FixedRatePanTiltController:
                     self._reset_error_rates()
                     if self.turret.torque:
                         self.turret.torque_off(best_effort=False)
-                    if now >= next_inactive_feedback:
+                    if not health_due and now >= next_inactive_feedback:
                         self._timed_feedback_read()
                         self.turret.pan_cmd = self.turret.pan_actual
                         self.turret.tilt_cmd = self.turret.tilt_actual
@@ -750,9 +819,21 @@ class FixedRatePanTiltController:
                             now + self.INACTIVE_FEEDBACK_PERIOD_SEC
                         )
 
-                if now >= next_health_read:
-                    pan_health, tilt_health = self.turret.read_health()
+                if health_due:
+                    pan_health, tilt_health = self._timed_health_read()
                     next_health_read = now + self.HEALTH_PERIOD_SEC
+                    # The health sync-read also includes present position and
+                    # velocity, so do not perform another feedback transaction
+                    # immediately after it.
+                    next_active_feedback = (
+                        now + self.ACTIVE_FEEDBACK_PERIOD_SEC
+                    )
+                    next_inactive_feedback = (
+                        now + self.INACTIVE_FEEDBACK_PERIOD_SEC
+                    )
+                    if not active:
+                        self.turret.pan_cmd = self.turret.pan_actual
+                        self.turret.tilt_cmd = self.turret.tilt_actual
                     if pan_health.hardware_error or tilt_health.hardware_error:
                         raise DynamixelHardwareError(
                             "Dynamixel hardware error: "
