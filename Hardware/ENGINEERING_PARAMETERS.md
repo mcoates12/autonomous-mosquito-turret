@@ -28,6 +28,8 @@ distortion, and calibration quality affect the fitted intrinsics.
 
 ### Known V4L2 controls
 
+- `/dev/video1` identifies Camera 1 (`ar0234 10-0042`) and reports
+  1920 x 1200 UYVY capture at 60 FPS
 - Exposure modes: full-frame automatic, manual, and ROI automatic
 - Absolute exposure range: 1 to 10,000
 - Gain range: 1 to 40
@@ -148,8 +150,6 @@ Desired maximum physical pan and tilt speeds have not yet been selected.
 
 ## Remaining measurements and validation
 
-- Collect `v4l2-ctl --all -d /dev/video1`; the previous attempt was mistyped as
-  `vv4l2-ctl`.
 - Run the committed controller on the Jetson and collect
   `laser_follow_debug.log`.
 - Record stationary, slow-sweep, fast-sweep, reversal, and irregular-motion

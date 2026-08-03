@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Turret Tracking Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b11;
+      --panel: #101722;
+      --panel-2: #151f2c;
+      --line: #263449;
+      --text: #e8eef7;
+      --muted: #91a0b5;
+      --cyan: #32d5ff;
+      --green: #4ce29a;
+      --amber: #ffc857;
+      --red: #ff6376;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 20% -10%, #17283c 0, transparent 34%), var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 11, 17, .9);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      backdrop-filter: blur(12px);
+    }
+    h1 { margin: 0; font-size: 19px; letter-spacing: .04em; }
+    .subtitle { color: var(--muted); font-size: 12px; }
+    .badges, .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .badge {
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--panel);
+    }
+    .badge.ok { border-color: #236b50; color: var(--green); }
+    .badge.warn { border-color: #7b5c20; color: var(--amber); }
+    .badge.error { border-color: #863342; color: var(--red); }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 13px;
+      background: var(--panel-2);
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button:hover { border-color: var(--cyan); }
+    button.start { background: #0f593f; border-color: #23805f; }
+    button.stop { background: #702533; border-color: #a83a4e; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 390px;
+      gap: 14px;
+      padding: 14px;
+      max-width: 1800px;
+      margin: 0 auto;
+    }
+    .card {
+      background: rgba(16, 23, 34, .94);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 14px 38px rgba(0,0,0,.22);
+    }
+    .card-title, summary {
+      padding: 11px 13px;
+      color: #c8d5e6;
+      font-weight: 700;
+      letter-spacing: .03em;
+    }
+    .video-stack { display: grid; gap: 14px; align-content: start; }
+    .video-wrap {
+      min-height: 360px;
+      background: #020407;
+      display: grid;
+      place-items: center;
+      border-top: 1px solid var(--line);
+    }
+    .video-wrap img { width: 100%; height: auto; display: block; }
+    .mask-wrap { min-height: 180px; }
+    .status-line {
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      color: #cdd8e8;
+      min-height: 46px;
+      overflow-wrap: anywhere;
+    }
+    .error-banner {
+      display: none;
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      color: #ffdbe0;
+      background: #5a1e29;
+      border: 1px solid #a83a4e;
+      border-radius: 10px;
+    }
+    .controls { display: grid; gap: 10px; align-content: start; }
+    details { border-bottom: 1px solid var(--line); }
+    details:last-child { border-bottom: 0; }
+    summary { cursor: pointer; background: rgba(255,255,255,.015); }
+    .form-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 130px;
+      gap: 8px 10px;
+      padding: 4px 13px 14px;
+      align-items: center;
+    }
+    label { color: var(--muted); }
+    input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 8px;
+      color: var(--text);
+      background: #0a1018;
+    }
+    input[type="checkbox"] { width: 20px; height: 20px; justify-self: end; }
+    input:focus, select:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+    .hint { color: var(--muted); font-size: 12px; padding: 0 13px 13px; }
+    @media (max-width: 1050px) {
+      main { grid-template-columns: 1fr; }
+      .controls { grid-row: 2; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>TURRET TRACKING DASHBOARD</h1>
+      <div class="subtitle">Jetson-local control · browser diagnostic preview</div>
+    </div>
+    <div class="badges">
+      <span id="connectionBadge" class="badge warn">CONNECTING</span>
+      <span id="trackingBadge" class="badge">TRACKING OFF</span>
+      <span id="previewBadge" class="badge">NO PREVIEW</span>
+    </div>
+    <div class="actions">
+      <button id="startButton" class="start">Start tracking</button>
+      <button id="stopButton" class="stop">Stop / torque off</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="video-stack">
+      <div id="errorBanner" class="error-banner"></div>
+      <div class="card">
+        <div class="card-title">CAMERA PREVIEW</div>
+        <div class="video-wrap"><img src="/api/preview.mjpg" alt="Camera preview"></div>
+        <div id="statusLine" class="status-line">Waiting for runtime status…</div>
+      </div>
+      <div class="card">
+        <div class="card-title">DETECTION MASK</div>
+        <div class="video-wrap mask-wrap"><img src="/api/mask.mjpg" alt="Detection mask"></div>
+      </div>
+    </section>
+
+    <aside class="controls card">
+      <details open>
+        <summary>Camera and view</summary>
+        <div class="form-grid">
+          <label for="display_mode">Display</label>
+          <select id="display_mode" data-param="display_mode">
+            <option>Left</option><option>Right</option><option>Side-by-side</option><option>Combined</option>
+          </select>
+          <label for="track_source">Tracking camera</label>
+          <select id="track_source" data-param="track_source"><option>Left</option><option>Right</option></select>
+          <label for="manual_exposure">Manual exposure</label>
+          <input id="manual_exposure" type="checkbox" data-param="manual_exposure">
+          <label for="exposure_time_absolute">Exposure (0.1 ms)</label>
+          <input id="exposure_time_absolute" type="number" min="1" max="160" step="1" data-param="exposure_time_absolute">
+          <label for="camera_gain">Gain</label>
+          <input id="camera_gain" type="number" min="1" max="40" step="1" data-param="camera_gain">
+          <label for="auto_white_balance">Auto white balance</label>
+          <input id="auto_white_balance" type="checkbox" data-param="auto_white_balance">
+          <label for="white_balance_temperature">White balance (K)</label>
+          <input id="white_balance_temperature" type="number" min="10" max="10000" step="10" data-param="white_balance_temperature">
+          <label for="low_latency_mode">Low-latency driver mode</label>
+          <input id="low_latency_mode" type="checkbox" data-param="low_latency_mode">
+        </div>
+      </details>
+
+      <details open>
+        <summary>Red-dot detection</summary>
+        <div class="form-grid">
+          <label for="v_thresh">Brightness threshold</label>
+          <input id="v_thresh" type="number" min="0" max="255" step="1" data-param="v_thresh">
+          <label for="s_thresh">Saturation threshold</label>
+          <input id="s_thresh" type="number" min="0" max="255" step="1" data-param="s_thresh">
+          <label for="min_area">Minimum area</label>
+          <input id="min_area" type="number" min="0" max="200" step="1" data-param="min_area">
+          <label for="max_area">Maximum area</label>
+          <input id="max_area" type="number" min="1" max="5000" step="10" data-param="max_area">
+          <label for="peak_v_gate">Peak brightness gate</label>
+          <input id="peak_v_gate" type="number" min="0" max="255" step="1" data-param="peak_v_gate">
+          <label for="area_hi_gate">Hard area gate</label>
+          <input id="area_hi_gate" type="number" min="1" max="5000" step="10" data-param="area_hi_gate">
+          <label for="laser_roi_half_size">Search ROI half-size</label>
+          <input id="laser_roi_half_size" type="number" min="32" max="960" step="1" data-param="laser_roi_half_size">
+        </div>
+      </details>
+
+      <details>
+        <summary>Filtering and lock</summary>
+        <div class="form-grid">
+          <label for="smoothing_tau_ms">Smoothing (ms)</label>
+          <input id="smoothing_tau_ms" type="number" min="5" max="500" step="5" data-param="smoothing_tau_ms">
+          <label for="lock_time_ms">Lock time (ms)</label>
+          <input id="lock_time_ms" type="number" min="0" max="1000" step="10" data-param="lock_time_ms">
+          <label for="outlier_speed_px_s">Outlier speed (px/s)</label>
+          <input id="outlier_speed_px_s" type="number" min="100" max="20000" step="100" data-param="outlier_speed_px_s">
+          <label for="deadband_px">Deadband (px)</label>
+          <input id="deadband_px" type="number" min="0" max="200" step="1" data-param="deadband_px">
+        </div>
+      </details>
+
+      <details>
+        <summary>Motion controller</summary>
+        <div class="form-grid">
+          <label for="servos_enabled">Servo enabled</label>
+          <input id="servos_enabled" type="checkbox" data-param="servos_enabled">
+          <label for="deg_per_px_pan">Pan degrees/pixel</label>
+          <input id="deg_per_px_pan" type="number" min="0.0001" max="0.05" step="0.0005" data-param="deg_per_px_pan">
+          <label for="deg_per_px_tilt">Tilt degrees/pixel</label>
+          <input id="deg_per_px_tilt" type="number" min="0.0001" max="0.05" step="0.0005" data-param="deg_per_px_tilt">
+          <label for="max_step_deg">Maximum step (deg)</label>
+          <input id="max_step_deg" type="number" min="0.1" max="20" step="0.1" data-param="max_step_deg">
+          <label for="rate_hz">Controller rate (Hz)</label>
+          <input id="rate_hz" type="number" min="5" max="120" step="1" data-param="rate_hz">
+          <label for="profile_velocity">Profile velocity</label>
+          <input id="profile_velocity" type="number" min="2" max="1500" step="1" data-param="profile_velocity">
+          <label for="profile_acceleration">Profile acceleration</label>
+          <input id="profile_acceleration" type="number" min="1" max="750" step="1" data-param="profile_acceleration">
+          <label for="pan_dir">Pan direction</label>
+          <select id="pan_dir" data-param="pan_dir"><option value="-1">-1</option><option value="1">+1</option></select>
+          <label for="tilt_dir">Tilt direction</label>
+          <select id="tilt_dir" data-param="tilt_dir"><option value="-1">-1</option><option value="1">+1</option></select>
+        </div>
+        <div class="hint">Tracking starts disabled. Stop/torque-off remains available even if preview frames are delayed.</div>
+      </details>
+    </aside>
+  </main>
+
+  <script>
+    const fields = [...document.querySelectorAll('[data-param]')];
+    const connectionBadge = document.getElementById('connectionBadge');
+    const trackingBadge = document.getElementById('trackingBadge');
+    const previewBadge = document.getElementById('previewBadge');
+    const statusLine = document.getElementById('statusLine');
+    const errorBanner = document.getElementById('errorBanner');
+    let initialized = false;
+
+    async function post(path, body) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      return data;
+    }
+
+    function valueFor(field) {
+      if (field.type === 'checkbox') return field.checked;
+      if (field.type === 'number') return Number(field.value);
+      if (field.dataset.param === 'pan_dir' || field.dataset.param === 'tilt_dir') return Number(field.value);
+      return field.value;
+    }
+
+    fields.forEach(field => field.addEventListener('change', async () => {
+      try {
+        await post('/api/params', {[field.dataset.param]: valueFor(field)});
+        errorBanner.style.display = 'none';
+      } catch (error) {
+        errorBanner.textContent = error.message;
+        errorBanner.style.display = 'block';
+      }
+    }));
+
+    document.getElementById('startButton').addEventListener('click', async () => {
+      try { await post('/api/tracking', {enabled: true}); }
+      catch (error) { errorBanner.textContent = error.message; errorBanner.style.display = 'block'; }
+    });
+    document.getElementById('stopButton').addEventListener('click', async () => {
+      try { await post('/api/tracking', {enabled: false}); }
+      catch (error) { errorBanner.textContent = error.message; errorBanner.style.display = 'block'; }
+    });
+
+    function render(state) {
+      connectionBadge.textContent = 'JETSON CONNECTED';
+      connectionBadge.className = 'badge ok';
+      statusLine.textContent = state.status || 'No status available';
+      const tracking = Boolean(state.params.tracking_enabled);
+      trackingBadge.textContent = tracking ? 'TRACKING ON' : 'TRACKING OFF';
+      trackingBadge.className = tracking ? 'badge ok' : 'badge';
+      const age = state.preview_age_s;
+      if (age === null) {
+        previewBadge.textContent = 'WAITING FOR PREVIEW';
+        previewBadge.className = 'badge warn';
+      } else {
+        previewBadge.textContent = `${age.toFixed(1)}s PREVIEW AGE`;
+        previewBadge.className = age < 1.0 ? 'badge ok' : 'badge warn';
+      }
+      if (state.error) {
+        errorBanner.textContent = state.error;
+        errorBanner.style.display = 'block';
+      }
+      if (!initialized) {
+        fields.forEach(field => {
+          const value = state.params[field.dataset.param];
+          if (field.type === 'checkbox') field.checked = Boolean(value);
+          else field.value = value;
+        });
+        initialized = true;
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/state', {cache: 'no-store'});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        connectionBadge.textContent = 'JETSON DISCONNECTED';
+        connectionBadge.className = 'badge error';
+        statusLine.textContent = error.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>

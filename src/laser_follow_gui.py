@@ -384,6 +384,37 @@ class ParamStore:
             setattr(self._p, name, value)
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    cam_left: int
+    cam_right: int
+    width: int
+    height: int
+    port: str
+    baud: int
+    pan_id: int
+    tilt_id: int
+    calib_path: str
+
+
+def default_runtime_config() -> RuntimeConfig:
+    return RuntimeConfig(
+        cam_left=1,
+        cam_right=0,
+        width=1920,
+        height=1200,
+        port="/dev/ttyUSB0",
+        baud=1000000,
+        pan_id=1,
+        tilt_id=2,
+        calib_path=str(
+            Path(__file__).resolve().parent
+            / "stereo_calib"
+            / "stereo_calibration_full.npz"
+        ),
+    )
+
+
 def v4l2_control_signature(p: LiveParams) -> Tuple[object, ...]:
     """Return the camera settings whose changes require a V4L2 update."""
     return (
@@ -1608,19 +1639,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Defaults
         self.store = ParamStore()
-        self.cam_left = 1
-        self.cam_right = 0
-        self.calib_path = str(
-            Path(__file__).resolve().parent
-            / "stereo_calib"
-            / "stereo_calibration_full.npz"
-        )
-        self.width = 1920
-        self.height = 1200
-        self.port = "/dev/ttyUSB0"
-        self.baud = 1000000
-        self.pan_id = 1
-        self.tilt_id = 2
+        config = default_runtime_config()
+        self.cam_left = config.cam_left
+        self.cam_right = config.cam_right
+        self.calib_path = config.calib_path
+        self.width = config.width
+        self.height = config.height
+        self.port = config.port
+        self.baud = config.baud
+        self.pan_id = config.pan_id
+        self.tilt_id = config.tilt_id
 
         self.worker = None
         self.preview_timer = QtCore.QTimer(self)

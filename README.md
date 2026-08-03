@@ -49,6 +49,46 @@ Create a fully autonomous turret capable of:
 
 ---
 
+## Browser troubleshooting dashboard
+
+The recommended troubleshooting interface runs on the Jetson without a Linux
+desktop or VNC session. Camera capture, detection, and servo control stay on the
+Jetson; the PC receives a reduced-rate diagnostic MJPEG preview and sends only
+validated parameter changes.
+
+On the Jetson:
+
+```bash
+cd ~/Documents/autonomous-mosquito-turret
+git pull --ff-only origin main
+python3 src/laser_follow_web.py
+```
+
+Tracking starts disabled. Keep the Jetson terminal open, and press `Ctrl+C` for
+a clean shutdown and torque-off.
+
+When using VS Code Remote SSH, open the **Ports** panel, choose **Forward a
+Port**, enter `8080`, then open the forwarded address in the PC browser.
+
+Alternatively, keep this command running in a Windows PowerShell window:
+
+```powershell
+ssh -N -L 8080:127.0.0.1:8080 myles@192.168.1.141
+```
+
+PowerShell showing no prompt or output means the tunnel is working. Open
+<http://127.0.0.1:8080> in the PC browser. The dashboard automatically disables
+tracking if its heartbeat disappears for five seconds.
+
+For a trusted private LAN only, the dashboard can be exposed directly with
+`python3 src/laser_follow_web.py --bind 0.0.0.0`, then opened at
+`http://JETSON_IP:8080`. This mode has no authentication, so the SSH/VS Code
+forward is preferred.
+
+The diagnostic stream defaults to 10 FPS at 960 pixels wide and does not set
+the camera capture rate. On a heavily loaded Jetson, reduce dashboard overhead
+with `--preview-fps 5 --preview-width 640`.
+
 > 🔍 [Read the full project backstory → logs/project-intro.md](logs/project-intro.md)
 
 ## 👤 Author
