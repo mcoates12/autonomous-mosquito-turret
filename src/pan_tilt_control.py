@@ -48,6 +48,15 @@ TORQUE_ON, TORQUE_OFF = 1, 0
 DXL_VELOCITY_UNIT_DEG_S = 0.229 * 6.0
 BUS_WATCHDOG_TICKS = 25  # 25 * 20 ms = 500 ms
 APPLICATION_TILT_MIN_TICKS = 708  # Temporary 62.23-degree mechanical guard.
+SYNC_READ_ATTEMPTS = 2
+
+
+class DynamixelCommunicationError(RuntimeError):
+    """Transient transport/status-packet failure on the Dynamixel bus."""
+
+
+class DynamixelHardwareError(RuntimeError):
+    """Latched device-reported hardware fault that must not auto-rearm."""
 
 
 class ControlParams(Protocol):
@@ -144,7 +153,7 @@ class DynamixelPanTilt:
 
     def _check(self, servo_id: int, comm: int, err: int, what: str) -> None:
         if comm != 0:
-            raise RuntimeError(
+            raise DynamixelCommunicationError(
                 f"[ID:{servo_id}] {what} COMM FAIL: "
                 f"{self.packet_handler.getTxRxResult(comm)}"
             )
@@ -329,9 +338,13 @@ class DynamixelPanTilt:
         return value - (1 << 32) if value & (1 << 31) else value
 
     def read_feedback(self) -> Tuple[float, float, float, float]:
-        comm = self.sync_read_state.txRxPacket()
+        comm = 0
+        for _ in range(SYNC_READ_ATTEMPTS):
+            comm = self.sync_read_state.txRxPacket()
+            if comm == 0:
+                break
         if comm != 0:
-            raise RuntimeError(
+            raise DynamixelCommunicationError(
                 f"sync_read COMM FAIL: {self.packet_handler.getTxRxResult(comm)}"
             )
 
@@ -340,7 +353,9 @@ class DynamixelPanTilt:
             if not self.sync_read_state.isAvailable(
                 servo_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_STATE
             ):
-                raise RuntimeError(f"[ID:{servo_id}] present state unavailable")
+                raise DynamixelCommunicationError(
+                    f"[ID:{servo_id}] present state unavailable"
+                )
             raw_velocity = self.sync_read_state.getData(
                 servo_id, ADDR_PRESENT_VELOCITY, 4
             )
@@ -363,9 +378,13 @@ class DynamixelPanTilt:
         )
 
     def read_health(self) -> Tuple[ServoHealth, ServoHealth]:
-        comm = self.sync_read_health.txRxPacket()
+        comm = 0
+        for _ in range(SYNC_READ_ATTEMPTS):
+            comm = self.sync_read_health.txRxPacket()
+            if comm == 0:
+                break
         if comm != 0:
-            raise RuntimeError(
+            raise DynamixelCommunicationError(
                 f"health sync_read COMM FAIL: "
                 f"{self.packet_handler.getTxRxResult(comm)}"
             )
@@ -375,7 +394,9 @@ class DynamixelPanTilt:
             if not self.sync_read_health.isAvailable(
                 servo_id, ADDR_PRESENT_LOAD, LEN_PRESENT_HEALTH
             ):
-                raise RuntimeError(f"[ID:{servo_id}] health telemetry unavailable")
+                raise DynamixelCommunicationError(
+                    f"[ID:{servo_id}] health telemetry unavailable"
+                )
             raw_load = self.sync_read_health.getData(
                 servo_id, ADDR_PRESENT_LOAD, 2
             )
@@ -426,7 +447,7 @@ class DynamixelPanTilt:
 
         comm = self.sync_write_goal.txPacket()
         if comm != 0:
-            raise RuntimeError(
+            raise DynamixelCommunicationError(
                 f"sync_write COMM FAIL: {self.packet_handler.getTxRxResult(comm)}"
             )
 
@@ -458,6 +479,7 @@ class ControllerSnapshot:
     pan_hardware_error: int = 0
     tilt_hardware_error: int = 0
     error: Optional[str] = None
+    error_recoverable: bool = False
 
 
 class FixedRatePanTiltController:
@@ -477,6 +499,7 @@ class FixedRatePanTiltController:
         self._target = None
         self._move_updates = 0
         self._error = None
+        self._error_recoverable = False
         self._controller_rate_hz = 0.0
         self._deadline_misses = 0
         self._feedback_read_ms = 0.0
@@ -514,6 +537,7 @@ class FixedRatePanTiltController:
             pan_hardware_error=self.turret.pan_health.hardware_error,
             tilt_hardware_error=self.turret.tilt_health.hardware_error,
             error=self._error,
+            error_recoverable=self._error_recoverable,
         )
 
     def start(self) -> None:
@@ -583,6 +607,7 @@ class FixedRatePanTiltController:
         next_tick = last_tick
         next_inactive_feedback = last_tick
         next_health_read = last_tick
+        active = False
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
@@ -671,7 +696,7 @@ class FixedRatePanTiltController:
                     pan_health, tilt_health = self.turret.read_health()
                     next_health_read = now + self.HEALTH_PERIOD_SEC
                     if pan_health.hardware_error or tilt_health.hardware_error:
-                        raise RuntimeError(
+                        raise DynamixelHardwareError(
                             "Dynamixel hardware error: "
                             f"pan=0x{pan_health.hardware_error:02x} "
                             f"tilt=0x{tilt_health.hardware_error:02x}"
@@ -680,6 +705,15 @@ class FixedRatePanTiltController:
                 self._publish_snapshot(target_age)
         except Exception as exc:
             self._error = str(exc)
+            # Only an inactive, torque-off communication loss is eligible for
+            # automatic reconnect. A failure during tracking, while torque is
+            # on, or a device-reported hardware fault remains latched and must
+            # be explicitly rearmed by the operator.
+            self._error_recoverable = (
+                isinstance(exc, DynamixelCommunicationError)
+                and not active
+                and not self.turret.torque
+            )
             try:
                 self.turret.torque_off(best_effort=True)
             finally:

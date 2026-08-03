@@ -1462,9 +1462,21 @@ class LaserWorker(QtCore.QThread):
                     and controller_state.error is not None
                 ):
                     self.servo_note = controller_state.error
-                    logger.error("servo controller stopped: %s", self.servo_note)
+                    recoverable = controller_state.error_recoverable
+                    if recoverable:
+                        logger.warning(
+                            "servo communication interrupted while torque was "
+                            "off; reconnecting: %s",
+                            self.servo_note,
+                        )
+                    else:
+                        logger.error(
+                            "servo controller stopped: %s", self.servo_note
+                        )
                     self._disconnect_servo()
-                    self._servo_fault_latched = True
+                    self._servo_fault_latched = not recoverable
+                    if recoverable:
+                        self._next_servo_retry_at = time.monotonic() + 0.5
                     controller_state = None
                 if (
                     self.controller is None
@@ -1590,6 +1602,7 @@ class LaserWorker(QtCore.QThread):
                 cx0, cy0 = self.width // 2, self.height // 2
                 status = ""
                 preview_target = None
+                preview_locked = False
                 depth_str = "depth=NA"
                 stats.record_frame()
                 if target is not None:
@@ -1601,6 +1614,7 @@ class LaserWorker(QtCore.QThread):
                     err_y = filtered_target.y - cy0
                     
                     locked = filtered_target.locked
+                    preview_locked = locked
 
                     if self.controller is not None:
                         self.controller.publish_target(
@@ -1711,15 +1725,26 @@ class LaserWorker(QtCore.QThread):
                             (0, 255, 255),
                             2,
                         )
-                        cv2.putText(
-                            frame,
-                            depth_str,
-                            (10, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.9,
-                            (255, 255, 255),
-                            2,
-                        )
+                    # The HTML status line and MJPEG image travel over
+                    # independent browser requests and can be briefly out of
+                    # phase. Put the authoritative target state in the image
+                    # itself so a NOT FOUND frame can never appear to retain a
+                    # valid tracking marker.
+                    preview_target_state = (
+                        f"TARGET={'LOCKED' if preview_locked else 'ACQUIRING'} "
+                        f"{depth_str}"
+                        if preview_target is not None
+                        else "TARGET=NONE"
+                    )
+                    cv2.putText(
+                        frame,
+                        preview_target_state,
+                        (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (255, 255, 255),
+                        2,
+                    )
                     selected_health = (
                         self.readerL.health()
                         if p.track_source == "Left"

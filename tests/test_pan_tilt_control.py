@@ -24,6 +24,7 @@ from pan_tilt_control import (
     ADDR_MIN_POSITION_LIMIT,
     APPLICATION_TILT_MIN_TICKS,
     DynamixelPanTilt,
+    DynamixelCommunicationError,
     FixedRatePanTiltController,
     ServoHealth,
 )
@@ -66,8 +67,11 @@ class FakeTurret:
         self.move_event = threading.Event()
         self.torque_off_event = threading.Event()
         self.last_profile = None
+        self.feedback_error = None
 
     def read_feedback(self):
+        if self.feedback_error is not None:
+            raise self.feedback_error
         return (
             self.pan_actual,
             self.tilt_actual,
@@ -146,6 +150,52 @@ class FixedRateControllerTests(unittest.TestCase):
             snapshot = controller.snapshot()
             self.assertIsNotNone(snapshot.error)
             self.assertIn("hardware error", snapshot.error)
+            self.assertFalse(snapshot.error_recoverable)
+            self.assertFalse(snapshot.torque_enabled)
+        finally:
+            controller.stop()
+
+    def test_inactive_communication_loss_is_recoverable(self):
+        turret = FakeTurret()
+        turret.feedback_error = DynamixelCommunicationError(
+            "sync_read COMM FAIL: no status packet"
+        )
+        store = FakeStore()
+        store.params.tracking_enabled = False
+        controller = FixedRatePanTiltController(turret, store)
+        controller.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while (
+                controller.snapshot().error is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            snapshot = controller.snapshot()
+            self.assertIsNotNone(snapshot.error)
+            self.assertTrue(snapshot.error_recoverable)
+            self.assertFalse(snapshot.torque_enabled)
+        finally:
+            controller.stop()
+
+    def test_active_communication_loss_stays_latched(self):
+        turret = FakeTurret()
+        turret.feedback_error = DynamixelCommunicationError(
+            "sync_read COMM FAIL: no status packet"
+        )
+        store = FakeStore()
+        controller = FixedRatePanTiltController(turret, store)
+        controller.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while (
+                controller.snapshot().error is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            snapshot = controller.snapshot()
+            self.assertIsNotNone(snapshot.error)
+            self.assertFalse(snapshot.error_recoverable)
             self.assertFalse(snapshot.torque_enabled)
         finally:
             controller.stop()
@@ -174,6 +224,42 @@ class ConfiguredLimitTests(unittest.TestCase):
             turret.position_limits_ticks[2],
             (APPLICATION_TILT_MIN_TICKS, 2190),
         )
+
+
+class SyncReadRetryTests(unittest.TestCase):
+    def test_feedback_read_retries_one_missed_status_packet(self):
+        class FakeSyncRead:
+            def __init__(self):
+                self.results = [-3001, 0]
+                self.calls = 0
+
+            def txRxPacket(self):
+                result = self.results[min(self.calls, len(self.results) - 1)]
+                self.calls += 1
+                return result
+
+            def isAvailable(self, servo_id, address, length):
+                return True
+
+            def getData(self, servo_id, address, length):
+                return 0 if address == 128 else 2048
+
+        class FakePacketHandler:
+            @staticmethod
+            def getTxRxResult(comm):
+                return "There is no status packet!"
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.pan_id = 1
+        turret.tilt_id = 2
+        turret.sync_read_state = FakeSyncRead()
+        turret.packet_handler = FakePacketHandler()
+
+        pan, tilt, pan_velocity, tilt_velocity = turret.read_feedback()
+
+        self.assertEqual(turret.sync_read_state.calls, 2)
+        self.assertAlmostEqual(pan, tilt)
+        self.assertEqual((pan_velocity, tilt_velocity), (0.0, 0.0))
 
 if __name__ == "__main__":
     unittest.main()
