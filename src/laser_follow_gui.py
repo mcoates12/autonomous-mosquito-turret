@@ -333,6 +333,7 @@ class LiveParams:
 
     # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
+    local_contrast_gate: int = 25  # peak V above nearby background
     area_hi_gate: float = 40.0    # reject huge blobs
     smoothing_tau_ms: float = 60.0
     lock_time_ms: float = 50.0
@@ -531,12 +532,38 @@ def find_laser_target_red(
     best, best_score = None, -1.0
     for c in contours:
         area = cv2.contourArea(c)
-        if area < p.min_area or area > p.max_area:
+        if (
+            area < p.min_area
+            or area > p.max_area
+            or area > float(p.area_hi_gate)
+        ):
             continue
         x, y, w, h2 = cv2.boundingRect(c)
         roi_v = v[y:y+h2, x:x+w]
-        mean_v = float(np.mean(roi_v)) if roi_v.size else 0.0
-        score = mean_v - 0.03 * area
+        roi_threshold = threshold_mask[y:y+h2, x:x+w]
+        candidate_v = roi_v[roi_threshold != 0]
+        if candidate_v.size == 0:
+            continue
+        peak_v = int(np.max(candidate_v))
+        if peak_v < int(p.peak_v_gate):
+            continue
+
+        # A laser return is a sharp local brightness peak. Brown cardboard and
+        # other reddish surfaces can have the right HSV hue, but their nearby
+        # background is usually almost as bright as the candidate itself.
+        radius = 8
+        local_x1 = max(0, x - radius)
+        local_y1 = max(0, y - radius)
+        local_x2 = min(v.shape[1], x + w + radius)
+        local_y2 = min(v.shape[0], y + h2 + radius)
+        local_background_v = float(
+            np.median(v[local_y1:local_y2, local_x1:local_x2])
+        )
+        local_contrast = float(peak_v) - local_background_v
+        if local_contrast < float(p.local_contrast_gate):
+            continue
+
+        score = 2.0 * local_contrast + 0.25 * peak_v - 0.03 * area
         if score > best_score:
             best_score = score
             best = c
@@ -544,20 +571,15 @@ def find_laser_target_red(
     if best is None:
         return None, mask
 
-    # USE YOUR LIVE KNOBS HERE
-    area = float(cv2.contourArea(best))
-    if area > float(p.area_hi_gate):
-        return None, mask
-
     x, y, w, h2 = cv2.boundingRect(best)
     roi_v = v[y:y+h2, x:x+w]
-    peak_v = int(np.max(roi_v)) if roi_v.size else 0
-    if peak_v < int(p.peak_v_gate):
-        return None, mask
+    roi_threshold = threshold_mask[y:y+h2, x:x+w]
+    candidate_v = roi_v[roi_threshold != 0]
+    peak_v = int(np.max(candidate_v))
 
     # Brightness-weighted subpixel centroid. The raw (pre-dilation) threshold
     # mask prevents the morphology halo from shifting the measurement.
-    roi_binary = threshold_mask[y:y+h2, x:x+w].astype(np.float32) / 255.0
+    roi_binary = roi_threshold.astype(np.float32) / 255.0
     brightness = np.maximum(
         roi_v.astype(np.float32) - float(p.v_thresh) + 1.0,
         0.0,
@@ -1799,6 +1821,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_max_area = dbl(1.0, 5000.0, 10.0, p.max_area)
 
         self.sb_peak_gate = integer(0, 255, p.peak_v_gate)
+        self.sb_local_contrast_gate = integer(
+            0, 255, p.local_contrast_gate
+        )
         self.sb_area_hi_gate = dbl(1.0, 5000.0, 10.0, p.area_hi_gate)
         self.sb_smoothing_tau = dbl(5.0, 500.0, 5.0, p.smoothing_tau_ms)
         self.sb_lock_time = dbl(0.0, 1000.0, 10.0, p.lock_time_ms)
@@ -1845,6 +1870,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         form.addRow(QtWidgets.QLabel("— Confidence Gates —"), QtWidgets.QLabel(""))
         form.addRow("peak_v_gate", self.sb_peak_gate)
+        form.addRow("local_contrast_gate", self.sb_local_contrast_gate)
         form.addRow("area_hi_gate", self.sb_area_hi_gate)
         form.addRow("smoothing_tau_ms", self.sb_smoothing_tau)
         form.addRow("lock_time_ms", self.sb_lock_time)
@@ -1896,6 +1922,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_max_area.valueChanged.connect(lambda v: self.store.set_attr("max_area", float(v)))
 
         self.sb_peak_gate.valueChanged.connect(lambda v: self.store.set_attr("peak_v_gate", int(v)))
+        self.sb_local_contrast_gate.valueChanged.connect(
+            lambda v: self.store.set_attr("local_contrast_gate", int(v))
+        )
         self.sb_area_hi_gate.valueChanged.connect(lambda v: self.store.set_attr("area_hi_gate", float(v)))
         self.sb_smoothing_tau.valueChanged.connect(
             lambda v: self.store.set_attr("smoothing_tau_ms", float(v))
@@ -1957,6 +1986,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_max_area.setToolTip("Reject blobs larger than this area. Prevents big red objects from being treated as the dot.")
 
         self.sb_peak_gate.setToolTip("Hard gate: require the detected blob to contain pixels with V >= this value. Strongly reduces false positives.")
+        self.sb_local_contrast_gate.setToolTip(
+            "Require the candidate peak to be this much brighter than its "
+            "local background. Raise it to reject broad reddish objects."
+        )
         self.sb_area_hi_gate.setToolTip("Hard gate: reject any detection larger than this area even if it is red. Helps with big red patches.")
         self.sb_smoothing_tau.setToolTip(
             "Time-based laser smoothing in milliseconds. Lower follows faster; higher removes more jitter but adds lag."

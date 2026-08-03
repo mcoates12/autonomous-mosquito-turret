@@ -22,6 +22,7 @@ PARAMETER_SPECS = {
     "min_area": ParameterSpec(float, 0.0, 200.0),
     "max_area": ParameterSpec(float, 1.0, 5000.0),
     "peak_v_gate": ParameterSpec(int, 0, 255),
+    "local_contrast_gate": ParameterSpec(int, 0, 255),
     "area_hi_gate": ParameterSpec(float, 1.0, 5000.0),
     "smoothing_tau_ms": ParameterSpec(float, 5.0, 500.0),
     "lock_time_ms": ParameterSpec(float, 0.0, 1000.0),

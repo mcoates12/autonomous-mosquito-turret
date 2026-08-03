@@ -30,6 +30,8 @@ class ParameterValidationTests(unittest.TestCase):
             coerce_parameter("manual_exposure", 1)
         with self.assertRaisesRegex(ValueError, "at most 160"):
             coerce_parameter("exposure_time_absolute", 312)
+        with self.assertRaisesRegex(ValueError, "at most 255"):
+            coerce_parameter("local_contrast_gate", 256)
 
     def test_validates_entire_request_before_mutating_store(self):
         store = FakeStore()
