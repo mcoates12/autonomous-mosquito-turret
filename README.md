@@ -89,6 +89,11 @@ The diagnostic stream defaults to 10 FPS at 960 pixels wide and does not set
 the camera capture rate. On a heavily loaded Jetson, reduce dashboard overhead
 with `--preview-fps 5 --preview-width 640`.
 
+The runtime prefers the Jetson `nvv4l2camerasrc`/`nvvidconv` VIC conversion
+path and automatically falls back to the portable software pipeline if it is
+unavailable. In the preview overlay, `FPS` is the processed tracking rate and
+`src` is the selected camera's independently measured delivery rate.
+
 > 🔍 [Read the full project backstory → logs/project-intro.md](logs/project-intro.md)
 
 ## 👤 Author

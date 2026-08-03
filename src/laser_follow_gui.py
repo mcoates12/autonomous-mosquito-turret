@@ -24,6 +24,12 @@ from collections import deque
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from camera_pipeline import (
+    CapturePipeline,
+    capture_pipeline_candidates,
+    gst_v4l2_bgr_pipeline,
+    rolling_rate_hz,
+)
 from pan_tilt_control import DynamixelPanTilt, FixedRatePanTiltController
 from tracking_core import (
     ControlTarget,
@@ -82,9 +88,9 @@ class Stats:
         elapsed = self.frame_times[-1] - self.frame_times[0]
         return (len(self.frame_times) - 1) / max(1e-6, elapsed)
 
-    def hud(self):
+    def hud(self, source_fps: float = 0.0):
         # quick one-liner for overlay
-        return (f"FPS~{self.rolling_fps():.1f} "
+        return (f"FPS~{self.rolling_fps():.1f} src~{source_fps:.1f} "
                 f"found={self.found}/{self.frames} outlier={self.outliers} "
                 f"ROI ok={self.depth_roi_ok}/{self.depth_roi_calls} "
                 f"FULL={self.depth_full_calls} "
@@ -141,13 +147,15 @@ class Stats:
         if camera_health is not None:
             left_health, right_health = camera_health
             logger.info(
-                "camera left(ok=%s age=%s failures=%d reconnects=%d) "
-                "right(ok=%s age=%s failures=%d reconnects=%d)",
+                "camera left(ok=%s fps=%.1f age=%s failures=%d reconnects=%d) "
+                "right(ok=%s fps=%.1f age=%s failures=%d reconnects=%d)",
                 left_health.connected,
+                left_health.capture_fps,
                 "NA" if left_health.frame_age_sec is None else f"{left_health.frame_age_sec:.3f}s",
                 left_health.consecutive_failures,
                 left_health.reconnects,
                 right_health.connected,
+                right_health.capture_fps,
                 "NA" if right_health.frame_age_sec is None else f"{right_health.frame_age_sec:.3f}s",
                 right_health.consecutive_failures,
                 right_health.reconnects,
@@ -162,6 +170,7 @@ class CameraHealth:
     consecutive_failures: int
     reconnects: int
     frame_age_sec: Optional[float]
+    capture_fps: float
 
 
 class LatestFrame:
@@ -184,6 +193,7 @@ class LatestFrame:
         self.sequence = 0
         self.consecutive_failures = 0
         self.reconnects = 0
+        self.frame_times = deque(maxlen=240)
         self._last_reopen_attempt = 0.0
         self.stop_evt = threading.Event()
         self.th = threading.Thread(target=self._run, daemon=True)
@@ -257,6 +267,12 @@ class LatestFrame:
                     self.frame = f
                     self.timestamp = captured_at
                     self.sequence += 1
+                    self.frame_times.append(captured_at)
+                    while (
+                        self.frame_times
+                        and captured_at - self.frame_times[0] > 2.0
+                    ):
+                        self.frame_times.popleft()
                     self.consecutive_failures = 0
                 else:
                     self.consecutive_failures += 1
@@ -298,26 +314,8 @@ class LatestFrame:
                 consecutive_failures=self.consecutive_failures,
                 reconnects=self.reconnects,
                 frame_age_sec=age,
+                capture_fps=rolling_rate_hz(self.frame_times),
             )
-
-# -----------------------------
-# GStreamer pipeline helper
-# -----------------------------
-def gst_v4l2_bgr_pipeline(device: str, width: int, height: int, fps: int = 60) -> str:
-    """
-    V4L2 -> (optionally hw convert) -> BGR -> OpenCV appsink.
-    Notes:
-      - drop/max-buffers=1 keeps latency low (your main goal).
-      - sync=false prevents GStreamer from buffering to "sync" timestamps.
-      - If your camera doesn't support the requested caps, GStreamer will fail to preroll.
-    """
-    return (
-        f"v4l2src device={device} io-mode=2 ! "
-        f"video/x-raw, width={width}, height={height}, framerate={fps}/1 ! "
-        f"videoconvert ! "
-        f"video/x-raw, format=BGR ! "
-        f"appsink drop=true max-buffers=1 sync=false"
-    )
 
 # -----------------------------
 # Shared live parameters (GUI -> worker)
@@ -1238,41 +1236,80 @@ class LaserWorker(QtCore.QThread):
                 )
                 logger.addHandler(log_handler)
 
-            pipeL = gst_v4l2_bgr_pipeline(
-                f"/dev/video{self.cam_left}", self.width, self.height, fps=60
-            )
-            pipeR = gst_v4l2_bgr_pipeline(
-                f"/dev/video{self.cam_right}", self.width, self.height, fps=60
-            )
-
             self._apply_camera_controls(self.store.get(), logger, force=True)
 
-            def open_capture(device: str, pipeline: str) -> cv2.VideoCapture:
+            device_l = f"/dev/video{self.cam_left}"
+            device_r = f"/dev/video{self.cam_right}"
+            pipelines_by_device = {
+                device_l: capture_pipeline_candidates(
+                    device_l, self.width, self.height, fps=60
+                ),
+                device_r: capture_pipeline_candidates(
+                    device_r, self.width, self.height, fps=60
+                ),
+            }
+            pipeline_index = {device_l: 0, device_r: 0}
+
+            def open_capture(
+                device: str,
+                pipelines: Tuple[CapturePipeline, ...],
+                advance: bool = False,
+            ) -> cv2.VideoCapture:
                 # A reconnect can reset driver controls, so reapply them before
                 # every new GStreamer capture instance.
                 error = apply_v4l2_camera_controls(device, self.store.get())
                 if error is not None:
                     logger.warning("camera reconnect controls: %s", error)
-                capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-                if capture.isOpened():
-                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                return capture
+                start_index = pipeline_index[device]
+                if advance:
+                    start_index = (start_index + 1) % len(pipelines)
+                last_capture = None
+                for offset in range(len(pipelines)):
+                    index = (start_index + offset) % len(pipelines)
+                    candidate = pipelines[index]
+                    if last_capture is not None:
+                        last_capture.release()
+                    capture = cv2.VideoCapture(
+                        candidate.pipeline, cv2.CAP_GSTREAMER
+                    )
+                    if capture.isOpened():
+                        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                        pipeline_index[device] = index
+                        logger.info(
+                            "camera %s opened with %s pipeline",
+                            device,
+                            candidate.name,
+                        )
+                        return capture
+                    logger.warning(
+                        "camera %s could not open %s pipeline",
+                        device,
+                        candidate.name,
+                    )
+                    last_capture = capture
+                return last_capture
 
-            device_l = f"/dev/video{self.cam_left}"
-            device_r = f"/dev/video{self.cam_right}"
-            self.capL = open_capture(device_l, pipeL)
-            self.capR = open_capture(device_r, pipeR)
+            self.capL = open_capture(device_l, pipelines_by_device[device_l])
+            self.capR = open_capture(device_r, pipelines_by_device[device_r])
 
             self.readerL = LatestFrame(
                 self.capL,
                 "L",
-                reopen_factory=lambda: open_capture(device_l, pipeL),
+                reopen_factory=lambda: open_capture(
+                    device_l,
+                    pipelines_by_device[device_l],
+                    advance=True,
+                ),
             )
             self.readerR = LatestFrame(
                 self.capR,
                 "R",
-                reopen_factory=lambda: open_capture(device_r, pipeR),
+                reopen_factory=lambda: open_capture(
+                    device_r,
+                    pipelines_by_device[device_r],
+                    advance=True,
+                ),
             )
             self.readerL.start()
             self.readerR.start()
@@ -1579,9 +1616,14 @@ class LaserWorker(QtCore.QThread):
                             (255, 255, 255),
                             2,
                         )
+                    selected_health = (
+                        self.readerL.health()
+                        if p.track_source == "Left"
+                        else self.readerR.health()
+                    )
                     cv2.putText(
                         frame,
-                        stats.hud(),
+                        stats.hud(selected_health.capture_fps),
                         (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
