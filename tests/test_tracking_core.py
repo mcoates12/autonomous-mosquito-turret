@@ -14,6 +14,7 @@ from tracking_core import (
     position_ticks_to_degrees,
     sanitize_motion_profile,
     tracking_delta_degrees,
+    within_reacquisition_radius,
 )
 
 
@@ -112,6 +113,27 @@ class TrackingDeltaTests(unittest.TestCase):
     def test_invalid_detector_error_commands_no_motion(self):
         delta = tracking_delta_degrees(float("nan"), 0.006, 1, 1 / 60, 2.0)
         self.assertEqual(delta, 0.0)
+
+
+class ReacquisitionRadiusTests(unittest.TestCase):
+    def test_unrestricted_acquisition_without_existing_identity(self):
+        self.assertTrue(within_reacquisition_radius(900, 700, None, 300))
+        self.assertTrue(
+            within_reacquisition_radius(900, 700, (100, 100), None)
+        )
+
+    def test_accepts_nearby_candidate_and_rejects_distant_distractor(self):
+        self.assertTrue(
+            within_reacquisition_radius(400, 500, (100, 500), 300)
+        )
+        self.assertFalse(
+            within_reacquisition_radius(401, 500, (100, 500), 300)
+        )
+
+    def test_active_gate_fails_closed_for_invalid_coordinates(self):
+        self.assertFalse(
+            within_reacquisition_radius(float("nan"), 500, (100, 500), 300)
+        )
 
 
 if __name__ == "__main__":

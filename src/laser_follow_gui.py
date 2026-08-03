@@ -36,6 +36,7 @@ from tracking_core import (
     EveryNFrames,
     TargetObservation,
     TimeBasedTargetFilter,
+    within_reacquisition_radius,
 )
 
 # -----------------------------
@@ -329,18 +330,22 @@ class LiveParams:
     v_thresh: int = 80
     s_thresh: int = 35
     min_area: float = 1.0
-    max_area: float = 2000
+    max_area: float = 3000
 
     # confidence gates
     peak_v_gate: int = 140         # require bright core (210-245 range)
     local_contrast_gate: int = 25  # peak V above nearby background
-    local_red_contrast_gate: int = 6  # red excess above nearby wall
+    local_red_contrast_gate: int = 12  # red excess above nearby wall
     laser_edge_margin_px: int = 48  # ignore incomplete targets at frame edge
-    area_hi_gate: float = 40.0    # reject huge blobs
+    area_hi_gate: float = 3000.0  # tuned bright dot may bloom substantially
     smoothing_tau_ms: float = 60.0
     lock_time_ms: float = 50.0
     outlier_speed_px_s: float = 8000.0
     laser_roi_half_size: int = 160
+    # Once motion is enabled, never switch to an unrelated red object farther
+    # than this from the last accepted target. Stop -> Start deliberately clears
+    # the target identity and permits a new full-frame acquisition.
+    laser_reacquire_radius_px: int = 300
 
     # Start in the camera's automatic modes so the troubleshooting preview is
     # usable across lighting conditions. Manual controls remain available for
@@ -356,8 +361,8 @@ class LiveParams:
 
     # control
     deg_per_px_pan: float = 0.0060
-    deg_per_px_tilt: float = 0.0060
-    max_step_deg: float = 2.0
+    deg_per_px_tilt: float = 0.0030
+    max_step_deg: float = 0.75
     deadband_px: int = 25
     rate_hz: float = 60.0
 
@@ -502,6 +507,7 @@ def find_laser_target_red(
     frame_origin: Tuple[int, int] = (0, 0),
     full_frame_shape: Optional[Tuple[int, int]] = None,
     expected_position: Optional[Tuple[float, float]] = None,
+    max_expected_distance_px: Optional[float] = None,
 ) -> Tuple[Optional[TargetObservation], np.ndarray]:
     """
     Red-laser dot detection:
@@ -630,9 +636,16 @@ def find_laser_target_red(
                     candidate_y - expected_position[1],
                 )
             )
+            if not within_reacquisition_radius(
+                candidate_x,
+                candidate_y,
+                expected_position,
+                max_expected_distance_px,
+            ):
+                continue
             # Within the tracking ROI, prefer continuity over a slightly
-            # brighter distractor. Fast real motion remains possible; after
-            # three misses the detector performs an unbiased full reacquire.
+            # brighter distractor. During active tracking, the hard distance
+            # gate remains in force even after the ROI expands to full frame.
             score -= 0.5 * distance
         if score > best_score:
             best_score = score
@@ -674,7 +687,7 @@ def find_laser_target_red(
 
 
 class RedLaserDetector:
-    """Full-frame acquisition followed by expanding, low-cost ROI tracking."""
+    """Full-frame acquisition followed by identity-preserving ROI tracking."""
 
     FULL_SEARCH_AFTER_MISSES = 3
 
@@ -684,6 +697,12 @@ class RedLaserDetector:
     def reset(self) -> None:
         self._last_x = None
         self._last_y = None
+        self._misses = 0
+
+    def confirm(self, target: TargetObservation) -> None:
+        """Advance identity only after the worker accepts the observation."""
+        self._last_x = float(target.x)
+        self._last_y = float(target.y)
         self._misses = 0
 
     def detect(
@@ -697,6 +716,9 @@ class RedLaserDetector:
         using_tracking_roi = (
             self._last_x is not None
             and self._misses < self.FULL_SEARCH_AFTER_MISSES
+        )
+        preserving_identity = (
+            params.tracking_enabled and self._last_x is not None
         )
         if using_tracking_roi:
             base_half_size = max(32, int(params.laser_roi_half_size))
@@ -716,7 +738,12 @@ class RedLaserDetector:
             full_frame_shape=(height, width),
             expected_position=(
                 (self._last_x, self._last_y)
-                if using_tracking_roi
+                if using_tracking_roi or preserving_identity
+                else None
+            ),
+            max_expected_distance_px=(
+                params.laser_reacquire_radius_px
+                if preserving_identity
                 else None
             ),
         )
@@ -741,9 +768,6 @@ class RedLaserDetector:
             label=target.label,
             bbox_xyxy=adjusted_bbox,
         )
-        self._last_x = adjusted.x
-        self._last_y = adjusted.y
-        self._misses = 0
         return adjusted, mask
 
 
@@ -1147,6 +1171,7 @@ class LaserWorker(QtCore.QThread):
         self.detector = detector if detector is not None else RedLaserDetector()
         self._last_track_sequence = {"Left": 0, "Right": 0}
         self._active_track_source = None
+        self._active_tracking_enabled = None
 
         # Preview delivery is a latest-only, demand-driven side channel. A
         # headless caller that never requests a preview pays no composition cost.
@@ -1445,8 +1470,15 @@ class LaserWorker(QtCore.QThread):
                 p = self.store.get()
                 self._apply_camera_controls(p, logger)
 
-                if p.track_source != self._active_track_source:
+                tracking_mode_changed = (
+                    p.tracking_enabled != self._active_tracking_enabled
+                )
+                if (
+                    p.track_source != self._active_track_source
+                    or tracking_mode_changed
+                ):
                     self._active_track_source = p.track_source
+                    self._active_tracking_enabled = p.tracking_enabled
                     self.target_filter.reset()
                     if hasattr(self.detector, "reset"):
                         self.detector.reset()
@@ -1598,6 +1630,11 @@ class LaserWorker(QtCore.QThread):
                         if filtered_target.outlier:
                             stats.outliers += 1
                         target = None
+                    elif hasattr(self.detector, "confirm"):
+                        # The detector's identity anchor must follow only
+                        # observations accepted by the independent temporal
+                        # filter. A rejected outlier cannot drag the anchor.
+                        self.detector.confirm(target)
 
                 cx0, cy0 = self.width // 2, self.height // 2
                 status = ""
@@ -1942,6 +1979,9 @@ class MainWindow(QtWidgets.QMainWindow):
             100.0, 20000.0, 100.0, p.outlier_speed_px_s
         )
         self.sb_laser_roi = integer(32, 960, p.laser_roi_half_size)
+        self.sb_laser_reacquire = integer(
+            32, 1920, p.laser_reacquire_radius_px
+        )
 
         self.chk_manual_exposure = QtWidgets.QCheckBox()
         self.chk_manual_exposure.setChecked(p.manual_exposure)
@@ -1991,6 +2031,7 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("lock_time_ms", self.sb_lock_time)
         form.addRow("outlier_speed_px_s", self.sb_outlier_speed)
         form.addRow("laser_roi_half_size", self.sb_laser_roi)
+        form.addRow("laser_reacquire_radius_px", self.sb_laser_reacquire)
 
         form.addRow(QtWidgets.QLabel("— Camera —"), QtWidgets.QLabel(""))
         form.addRow("manual_exposure", self.chk_manual_exposure)
@@ -2060,6 +2101,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.sb_laser_roi.valueChanged.connect(
             lambda v: self.store.set_attr("laser_roi_half_size", int(v))
+        )
+        self.sb_laser_reacquire.valueChanged.connect(
+            lambda v: self.store.set_attr(
+                "laser_reacquire_radius_px", int(v)
+            )
         )
         self.chk_manual_exposure.stateChanged.connect(
             lambda _: self.store.set_attr(
@@ -2134,6 +2180,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.sb_laser_roi.setToolTip(
             "Half-width of the fast tracking search window. It expands automatically after misses."
+        )
+        self.sb_laser_reacquire.setToolTip(
+            "While tracking is active, reject any reacquisition farther than "
+            "this many source-image pixels from the last target. Stop and "
+            "Start tracking to deliberately acquire somewhere else."
         )
         self.chk_manual_exposure.setToolTip(
             "Use a fixed exposure so changing room light does not continuously move the detector thresholds."

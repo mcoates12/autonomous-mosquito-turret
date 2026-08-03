@@ -180,6 +180,32 @@ def tracking_delta_degrees(
     return clamp(delta, -max_delta, max_delta)
 
 
+def within_reacquisition_radius(
+    candidate_x: float,
+    candidate_y: float,
+    expected_position: Optional[Tuple[float, float]],
+    max_distance_px: Optional[float],
+) -> bool:
+    """Return whether a candidate preserves the current target identity.
+
+    A missing anchor or radius means this is a deliberate unrestricted
+    acquisition. Invalid coordinates fail closed whenever a gate is active.
+    The helper is detector-neutral so a future AI detector can reuse it.
+    """
+    if expected_position is None or max_distance_px is None:
+        return True
+    values = (
+        float(candidate_x),
+        float(candidate_y),
+        float(expected_position[0]),
+        float(expected_position[1]),
+        float(max_distance_px),
+    )
+    if not all(math.isfinite(value) for value in values) or values[4] < 0.0:
+        return False
+    return math.hypot(values[0] - values[2], values[1] - values[3]) <= values[4]
+
+
 class EveryNFrames:
     """Return ``True`` once every N calls, including the first call."""
 

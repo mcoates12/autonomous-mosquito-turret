@@ -89,6 +89,12 @@ The diagnostic stream defaults to 10 FPS at 960 pixels wide and does not set
 the camera capture rate. On a heavily loaded Jetson, reduce dashboard overhead
 with `--preview-fps 5 --preview-width 640`.
 
+During active tracking, reacquisition remains anchored to the last accepted
+target. If the dot is lost, the turret holds instead of switching to a distant
+red object. Press **Stop**, place the dot at the new location, and press
+**Start** to deliberately clear that identity and perform a fresh full-frame
+acquisition. The dashboard's `Reacquire radius` controls the allowed distance.
+
 The runtime prefers the Jetson `nvv4l2camerasrc`/`nvvidconv` VIC conversion
 path and automatically falls back to the portable software pipeline if it is
 unavailable. In the preview overlay, `FPS` is the processed tracking rate and

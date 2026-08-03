@@ -30,6 +30,7 @@ PARAMETER_SPECS = {
     "lock_time_ms": ParameterSpec(float, 0.0, 1000.0),
     "outlier_speed_px_s": ParameterSpec(float, 100.0, 20000.0),
     "laser_roi_half_size": ParameterSpec(int, 32, 960),
+    "laser_reacquire_radius_px": ParameterSpec(int, 32, 1920),
     "manual_exposure": ParameterSpec(bool),
     "exposure_time_absolute": ParameterSpec(int, 1, 160),
     "camera_gain": ParameterSpec(int, 1, 40),
