@@ -515,10 +515,14 @@ def find_laser_target_red(
         cv2.inRange(hsv, lower2, upper2),
     )
 
-    mask = cv2.morphologyEx(
-        threshold_mask, cv2.MORPH_OPEN, LASER_MORPH_KERNEL, iterations=1
+    # Do not use MORPH_OPEN here. Its erosion stage completely removes a real
+    # one- or two-pixel laser return before the contour/temporal gates can
+    # evaluate it. A single dilation makes those tiny candidates measurable;
+    # peak brightness, area, lock time, and outlier rejection still suppress
+    # isolated sensor noise before motion is allowed.
+    mask = cv2.dilate(
+        threshold_mask, LASER_MORPH_KERNEL, iterations=1
     )
-    mask = cv2.dilate(mask, LASER_MORPH_KERNEL, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
