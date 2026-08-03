@@ -49,6 +49,8 @@ DXL_VELOCITY_UNIT_DEG_S = 0.229 * 6.0
 BUS_WATCHDOG_TICKS = 25  # 25 * 20 ms = 500 ms
 APPLICATION_TILT_MIN_TICKS = 708  # Temporary 62.23-degree mechanical guard.
 SYNC_READ_ATTEMPTS = 2
+STATUS_READ_ATTEMPTS = 3
+STATUS_READ_RETRY_DELAY_SEC = 0.002
 
 
 class DynamixelCommunicationError(RuntimeError):
@@ -223,11 +225,26 @@ class DynamixelPanTilt:
         return int(value)
 
     def _read1(self, servo_id: int, address: int, what: str) -> int:
-        value, comm, err = self.packet_handler.read1ByteTxRx(
-            self.port_handler, servo_id, address
-        )
+        # A single malformed Protocol 2.0 status packet can occur while the
+        # half-duplex bus is busy. Retry only transport failures; a valid packet
+        # carrying a device error remains immediately fatal. Persistent
+        # transport failures still propagate to the controller's torque-off,
+        # operator-rearm safety latch.
+        value = 0
+        comm = 0
+        err = 0
+        for attempt in range(STATUS_READ_ATTEMPTS):
+            value, comm, err = self.packet_handler.read1ByteTxRx(
+                self.port_handler, servo_id, address
+            )
+            if comm == 0:
+                self._check(servo_id, comm, err, what)
+                return int(value)
+            if attempt + 1 < STATUS_READ_ATTEMPTS:
+                time.sleep(STATUS_READ_RETRY_DELAY_SEC)
+
         self._check(servo_id, comm, err, what)
-        return int(value)
+        raise AssertionError("unreachable")
 
     def _read_configured_limits(self) -> None:
         for servo_id in (self.pan_id, self.tilt_id):

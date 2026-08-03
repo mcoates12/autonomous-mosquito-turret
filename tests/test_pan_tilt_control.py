@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     sys.modules["dynamixel_sdk"] = sdk_stub
 
 from pan_tilt_control import (
+    ADDR_HARDWARE_ERROR_STATUS,
     ADDR_MAX_POSITION_LIMIT,
     ADDR_MIN_POSITION_LIMIT,
     APPLICATION_TILT_MIN_TICKS,
@@ -260,6 +261,93 @@ class SyncReadRetryTests(unittest.TestCase):
         self.assertEqual(turret.sync_read_state.calls, 2)
         self.assertAlmostEqual(pan, tilt)
         self.assertEqual((pan_velocity, tilt_velocity), (0.0, 0.0))
+
+    def test_hardware_status_read_recovers_from_transient_bad_packets(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.results = [
+                    (0, -3002, 0),
+                    (0, -3002, 0),
+                    (0x20, 0, 0),
+                ]
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                result = self.results[self.calls]
+                self.calls += 1
+                return result
+
+            @staticmethod
+            def getTxRxResult(comm):
+                return "Incorrect status packet!"
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        value = turret._read1(
+            1,
+            ADDR_HARDWARE_ERROR_STATUS,
+            "read hardware error status",
+        )
+
+        self.assertEqual(value, 0x20)
+        self.assertEqual(turret.packet_handler.calls, 3)
+
+    def test_hardware_status_read_raises_after_persistent_bad_packets(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                self.calls += 1
+                return 0, -3002, 0
+
+            @staticmethod
+            def getTxRxResult(comm):
+                return "Incorrect status packet!"
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        with self.assertRaisesRegex(
+            DynamixelCommunicationError,
+            "Incorrect status packet",
+        ):
+            turret._read1(
+                1,
+                ADDR_HARDWARE_ERROR_STATUS,
+                "read hardware error status",
+            )
+
+        self.assertEqual(turret.packet_handler.calls, 3)
+
+    def test_hardware_status_read_does_not_retry_device_error(self):
+        class FakePacketHandler:
+            def __init__(self):
+                self.calls = 0
+
+            def read1ByteTxRx(self, port_handler, servo_id, address):
+                self.calls += 1
+                return 0, 0, 1
+
+            @staticmethod
+            def getRxPacketError(err):
+                return "device-reported error"
+
+        turret = object.__new__(DynamixelPanTilt)
+        turret.port_handler = object()
+        turret.packet_handler = FakePacketHandler()
+
+        with self.assertRaisesRegex(RuntimeError, "device-reported error"):
+            turret._read1(
+                1,
+                ADDR_HARDWARE_ERROR_STATUS,
+                "read hardware error status",
+            )
+
+        self.assertEqual(turret.packet_handler.calls, 1)
 
 if __name__ == "__main__":
     unittest.main()
