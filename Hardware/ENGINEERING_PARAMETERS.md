@@ -33,8 +33,10 @@ distortion, and calibration quality affect the fitted intrinsics.
 - Gain range: 1 to 40
 - Automatic and fixed white balance are supported
 - Low-latency mode is supported
-- Current software starting point: manual exposure 100 (10 ms under standard
-  V4L2 units), gain 1, fixed white balance 4600, and low-latency mode enabled
+- Current software startup: automatic exposure and automatic white balance,
+  gain 1, and low-latency mode enabled
+- Manual tuning starts from exposure 100 (10 ms under standard V4L2 units) and
+  fixed white balance 4600 when the operator enables those modes
 - The GUI caps manual exposure at 160 (16 ms) to avoid silently reducing a
   nominal 60 FPS stream through excessive exposure time
 
@@ -164,4 +166,3 @@ Desired maximum physical pan and tilt speeds have not yet been selected.
   feedforward lead.
 - Recalculate final mass, COG, and inertia after all hardware and cable routing
   are complete.
-

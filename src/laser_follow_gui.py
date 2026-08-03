@@ -341,14 +341,15 @@ class LiveParams:
     outlier_speed_px_s: float = 8000.0
     laser_roi_half_size: int = 160
 
-    # AR0234 V4L2 controls. Fixed exposure/white balance keeps the detector's
-    # HSV thresholds stable instead of letting the image change underneath it.
-    manual_exposure: bool = True
+    # Start in the camera's automatic modes so the troubleshooting preview is
+    # usable across lighting conditions. Manual controls remain available for
+    # repeatable detector tuning after a suitable exposure has been found.
+    manual_exposure: bool = False
     # Standard V4L2 units are 100 us. 100 = 10 ms; keep the GUI at or below
     # 16 ms so exposure cannot silently force a nominal 60 FPS stream slower.
     exposure_time_absolute: int = 100
     camera_gain: int = 1
-    auto_white_balance: bool = False
+    auto_white_balance: bool = True
     white_balance_temperature: int = 4600
     low_latency_mode: bool = True
 
@@ -1639,9 +1640,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout = QtWidgets.QHBoxLayout(root)
 
-        # Left: controls
-        ctrl = QtWidgets.QVBoxLayout()
-        layout.addLayout(ctrl, 0)
+        # Left: controls. Keep every tuning control reachable on smaller remote
+        # desktops instead of allowing the form to extend below the window.
+        controls_widget = QtWidgets.QWidget()
+        ctrl = QtWidgets.QVBoxLayout(controls_widget)
+        controls_scroll = QtWidgets.QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarAlwaysOff
+        )
+        controls_scroll.setMinimumWidth(390)
+        controls_scroll.setWidget(controls_widget)
+        layout.addWidget(controls_scroll, 0)
 
         # Right: video
         video = QtWidgets.QVBoxLayout()
