@@ -1273,8 +1273,6 @@ class LaserWorker(QtCore.QThread):
                         candidate.pipeline, cv2.CAP_GSTREAMER
                     )
                     if capture.isOpened():
-                        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                         pipeline_index[device] = index
                         logger.info(
                             "camera %s opened with %s pipeline",

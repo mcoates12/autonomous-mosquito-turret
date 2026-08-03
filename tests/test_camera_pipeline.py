@@ -22,16 +22,23 @@ class CapturePipelineTests(unittest.TestCase):
         )
         accelerated = candidates[0].pipeline
         self.assertIn("nvv4l2camerasrc device=/dev/video1", accelerated)
-        self.assertIn("video/x-raw(memory:NVMM), format=UYVY", accelerated)
+        self.assertIn(
+            "video/x-raw(memory:NVMM), format=(string)UYVY",
+            accelerated,
+        )
         self.assertIn("nvvidconv", accelerated)
-        self.assertIn("width=1920, height=1200, framerate=60/1", accelerated)
+        self.assertIn(
+            "width=(int)1920, height=(int)1200, "
+            "framerate=(fraction)60/1",
+            accelerated,
+        )
         self.assertTrue(
             accelerated.endswith("sync=false processing-deadline=0")
         )
 
         fallback = candidates[1].pipeline
         self.assertIn("v4l2src device=/dev/video1 io-mode=2", fallback)
-        self.assertIn("format=UYVY", fallback)
+        self.assertIn("format=(string)UYVY", fallback)
         self.assertIn("videoconvert", fallback)
 
     def test_rolling_rate_uses_elapsed_capture_time(self):

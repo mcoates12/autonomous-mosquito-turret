@@ -23,14 +23,19 @@ def gst_nvidia_vic_bgr_pipeline(
     """Capture UYVY into NVMM and use the Jetson VIC for color conversion."""
     return (
         f"nvv4l2camerasrc device={device} ! "
-        "video/x-raw(memory:NVMM), format=UYVY, "
-        f"width={width}, height={height}, framerate={fps}/1, "
-        "interlace-mode=progressive ! "
+        "video/x-raw(memory:NVMM), format=(string)UYVY, "
+        f"width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1, "
+        "interlace-mode=(string)progressive ! "
         "queue max-size-buffers=1 leaky=downstream ! "
         "nvvidconv ! "
-        "video/x-raw, format=BGRx ! "
+        "video/x-raw, format=(string)BGRx, "
+        f"width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1 ! "
         "videoconvert ! "
-        "video/x-raw, format=BGR ! "
+        "video/x-raw, format=(string)BGR, "
+        f"width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1 ! "
         "appsink drop=true max-buffers=1 sync=false processing-deadline=0"
     )
 
@@ -41,10 +46,13 @@ def gst_v4l2_bgr_pipeline(
     """Portable software conversion fallback for non-NVIDIA pipelines."""
     return (
         f"v4l2src device={device} io-mode=2 ! "
-        "video/x-raw, format=UYVY, "
-        f"width={width}, height={height}, framerate={fps}/1 ! "
+        "video/x-raw, format=(string)UYVY, "
+        f"width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1 ! "
         "videoconvert ! "
-        "video/x-raw, format=BGR ! "
+        "video/x-raw, format=(string)BGR, "
+        f"width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1 ! "
         "appsink drop=true max-buffers=1 sync=false processing-deadline=0"
     )
 
