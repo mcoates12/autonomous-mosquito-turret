@@ -25,6 +25,8 @@ class ParameterValidationTests(unittest.TestCase):
         self.assertEqual(coerce_parameter("local_red_contrast_gate", 6), 6)
         self.assertEqual(coerce_parameter("laser_edge_margin_px", 48), 48)
         self.assertEqual(coerce_parameter("laser_reacquire_radius_px", 300), 300)
+        self.assertEqual(coerce_parameter("pan_damping_gain", 0.006), 0.006)
+        self.assertEqual(coerce_parameter("tilt_damping_gain", 0), 0.0)
 
     def test_rejects_unknown_wrong_type_and_out_of_range(self):
         with self.assertRaisesRegex(ValueError, "unknown parameter"):
@@ -41,6 +43,10 @@ class ParameterValidationTests(unittest.TestCase):
             coerce_parameter("laser_edge_margin_px", 481)
         with self.assertRaisesRegex(ValueError, "at most 1920"):
             coerce_parameter("laser_reacquire_radius_px", 1921)
+        with self.assertRaisesRegex(ValueError, "at most 0.05"):
+            coerce_parameter("pan_damping_gain", 0.051)
+        with self.assertRaisesRegex(ValueError, "at least 0.0"):
+            coerce_parameter("tilt_damping_gain", -0.001)
 
     def test_validates_entire_request_before_mutating_store(self):
         store = FakeStore()

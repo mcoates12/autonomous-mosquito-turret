@@ -180,6 +180,102 @@ def tracking_delta_degrees(
     return clamp(delta, -max_delta, max_delta)
 
 
+def tracking_pd_delta_degrees(
+    error_px: float,
+    error_rate_px_s: float,
+    proportional_gain_deg_per_px: float,
+    damping_gain_deg_per_px: float,
+    direction: int,
+    dt: float,
+    max_step_deg: float,
+    reference_hz: float = CONTROL_REFERENCE_HZ,
+) -> float:
+    """Return a time-scaled PD outer-loop command with the legacy step cap.
+
+    The proportional gain retains the existing per-reference-frame behavior.
+    The damping gain converts the measured pixel-error rate directly to an
+    opposing or assisting angular velocity. A closing error therefore brakes
+    the axis before it crosses the target, while an opening error helps the
+    axis begin following a moving target.
+    """
+    values = (
+        float(error_px),
+        float(error_rate_px_s),
+        float(proportional_gain_deg_per_px),
+        float(damping_gain_deg_per_px),
+        float(direction),
+        float(dt),
+        float(max_step_deg),
+        float(reference_hz),
+    )
+    if not all(math.isfinite(value) for value in values):
+        return 0.0
+    safe_dt = max(0.0, float(dt))
+    desired_velocity = float(direction) * (
+        float(proportional_gain_deg_per_px)
+        * float(error_px)
+        * float(reference_hz)
+        + float(damping_gain_deg_per_px) * float(error_rate_px_s)
+    )
+    delta = desired_velocity * safe_dt
+    max_delta = max(0.0, float(max_step_deg)) * reference_hz * safe_dt
+    return clamp(delta, -max_delta, max_delta)
+
+
+class FilteredDerivative:
+    """Estimate a derivative from timestamped samples without frame-rate bias."""
+
+    def __init__(self, smoothing_tau_sec: float, reset_after_sec: float):
+        if smoothing_tau_sec < 0.0:
+            raise ValueError("smoothing_tau_sec must be non-negative")
+        if reset_after_sec <= 0.0:
+            raise ValueError("reset_after_sec must be positive")
+        self.smoothing_tau_sec = float(smoothing_tau_sec)
+        self.reset_after_sec = float(reset_after_sec)
+        self.reset()
+
+    def reset(self) -> None:
+        self._last_value = None
+        self._last_timestamp = None
+        self._rate = 0.0
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    def update(self, value: float, timestamp: float) -> float:
+        value = float(value)
+        timestamp = float(timestamp)
+        if not (math.isfinite(value) and math.isfinite(timestamp)):
+            self.reset()
+            return 0.0
+
+        if self._last_timestamp is None:
+            self._last_value = value
+            self._last_timestamp = timestamp
+            self._rate = 0.0
+            return self._rate
+
+        dt = timestamp - self._last_timestamp
+        if dt == 0.0:
+            return self._rate
+        if dt < 0.0 or dt > self.reset_after_sec:
+            self._last_value = value
+            self._last_timestamp = timestamp
+            self._rate = 0.0
+            return self._rate
+
+        raw_rate = (value - self._last_value) / dt
+        if self.smoothing_tau_sec == 0.0:
+            alpha = 1.0
+        else:
+            alpha = 1.0 - math.exp(-dt / self.smoothing_tau_sec)
+        self._rate += alpha * (raw_rate - self._rate)
+        self._last_value = value
+        self._last_timestamp = timestamp
+        return self._rate
+
+
 def within_reacquisition_radius(
     candidate_x: float,
     candidate_y: float,

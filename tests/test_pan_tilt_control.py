@@ -41,6 +41,8 @@ class FakeParams:
     deadband_px = 0
     deg_per_px_pan = 0.006
     deg_per_px_tilt = 0.006
+    pan_damping_gain = 0.0
+    tilt_damping_gain = 0.0
     pan_dir = 1
     tilt_dir = 1
     max_step_deg = 2.0

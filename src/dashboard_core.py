@@ -39,6 +39,8 @@ PARAMETER_SPECS = {
     "low_latency_mode": ParameterSpec(bool),
     "deg_per_px_pan": ParameterSpec(float, 0.0001, 0.05),
     "deg_per_px_tilt": ParameterSpec(float, 0.0001, 0.05),
+    "pan_damping_gain": ParameterSpec(float, 0.0, 0.05),
+    "tilt_damping_gain": ParameterSpec(float, 0.0, 0.05),
     "max_step_deg": ParameterSpec(float, 0.1, 20.0),
     "deadband_px": ParameterSpec(int, 0, 200),
     "rate_hz": ParameterSpec(float, 5.0, 120.0),

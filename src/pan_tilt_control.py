@@ -14,11 +14,12 @@ from dynamixel_sdk import (  # type: ignore
 
 from tracking_core import (
     ControlTarget,
+    FilteredDerivative,
     clamp,
     degrees_to_position_ticks,
     position_ticks_to_degrees,
     sanitize_motion_profile,
-    tracking_delta_degrees,
+    tracking_pd_delta_degrees,
 )
 
 
@@ -70,6 +71,8 @@ class ControlParams(Protocol):
     deadband_px: int
     deg_per_px_pan: float
     deg_per_px_tilt: float
+    pan_damping_gain: float
+    tilt_damping_gain: float
     pan_dir: int
     tilt_dir: int
     max_step_deg: float
@@ -487,6 +490,8 @@ class ControllerSnapshot:
     deadline_misses: int = 0
     feedback_read_ms: float = 0.0
     command_write_ms: float = 0.0
+    pan_error_rate_px_s: float = 0.0
+    tilt_error_rate_px_s: float = 0.0
     pan_load_percent: float = 0.0
     tilt_load_percent: float = 0.0
     pan_voltage: float = 0.0
@@ -507,6 +512,7 @@ class FixedRatePanTiltController:
     HEALTH_PERIOD_SEC = 0.50
     MIN_MAX_CONTROL_DT_SEC = 0.05
     TIMING_EMA_ALPHA = 0.10
+    ERROR_RATE_FILTER_TAU_SEC = 0.05
 
     def __init__(self, turret: DynamixelPanTilt, store: ParamProvider):
         self.turret = turret
@@ -521,6 +527,16 @@ class FixedRatePanTiltController:
         self._deadline_misses = 0
         self._feedback_read_ms = 0.0
         self._command_write_ms = 0.0
+        self._pan_error_rate = FilteredDerivative(
+            self.ERROR_RATE_FILTER_TAU_SEC,
+            self.TARGET_STALE_SEC,
+        )
+        self._tilt_error_rate = FilteredDerivative(
+            self.ERROR_RATE_FILTER_TAU_SEC,
+            self.TARGET_STALE_SEC,
+        )
+        self._pan_error_rate_px_s = 0.0
+        self._tilt_error_rate_px_s = 0.0
         self._snapshot = self._make_snapshot()
         self._thread = threading.Thread(
             target=self._run,
@@ -545,6 +561,8 @@ class FixedRatePanTiltController:
             deadline_misses=self._deadline_misses,
             feedback_read_ms=self._feedback_read_ms,
             command_write_ms=self._command_write_ms,
+            pan_error_rate_px_s=self._pan_error_rate_px_s,
+            tilt_error_rate_px_s=self._tilt_error_rate_px_s,
             pan_load_percent=self.turret.pan_health.load_percent,
             tilt_load_percent=self.turret.tilt_health.load_percent,
             pan_voltage=self.turret.pan_health.input_voltage,
@@ -619,6 +637,12 @@ class FixedRatePanTiltController:
             self._command_write_ms, elapsed_ms
         )
 
+    def _reset_error_rates(self) -> None:
+        self._pan_error_rate.reset()
+        self._tilt_error_rate.reset()
+        self._pan_error_rate_px_s = 0.0
+        self._tilt_error_rate_px_s = 0.0
+
     def _run(self) -> None:
         last_tick = time.monotonic()
         next_tick = last_tick
@@ -671,23 +695,37 @@ class FixedRatePanTiltController:
                         and target_age is not None
                         and target_age <= self.TARGET_STALE_SEC
                     ):
-                        error_x = target.error_x_px
-                        error_y = target.error_y_px
+                        raw_error_x = target.error_x_px
+                        raw_error_y = target.error_y_px
+                        self._pan_error_rate_px_s = self._pan_error_rate.update(
+                            raw_error_x,
+                            target.timestamp,
+                        )
+                        self._tilt_error_rate_px_s = self._tilt_error_rate.update(
+                            raw_error_y,
+                            target.timestamp,
+                        )
+                        error_x = raw_error_x
+                        error_y = raw_error_y
                         if abs(error_x) < params.deadband_px:
                             error_x = 0.0
                         if abs(error_y) < params.deadband_px:
                             error_y = 0.0
 
-                        delta_pan = tracking_delta_degrees(
+                        delta_pan = tracking_pd_delta_degrees(
                             error_x,
+                            self._pan_error_rate_px_s,
                             params.deg_per_px_pan,
+                            params.pan_damping_gain,
                             params.pan_dir,
                             dt,
                             params.max_step_deg,
                         )
-                        delta_tilt = tracking_delta_degrees(
+                        delta_tilt = tracking_pd_delta_degrees(
                             error_y,
+                            self._tilt_error_rate_px_s,
                             params.deg_per_px_tilt,
+                            params.tilt_damping_gain,
                             params.tilt_dir,
                             dt,
                             params.max_step_deg,
@@ -698,7 +736,10 @@ class FixedRatePanTiltController:
                                 self.turret.tilt_cmd + delta_tilt,
                             )
                             self._move_updates += 1
+                    else:
+                        self._reset_error_rates()
                 else:
+                    self._reset_error_rates()
                     if self.turret.torque:
                         self.turret.torque_off(best_effort=False)
                     if now >= next_inactive_feedback:

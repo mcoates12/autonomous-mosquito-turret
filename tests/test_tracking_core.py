@@ -8,12 +8,14 @@ sys.path.insert(0, str(SRC_DIR))
 
 from tracking_core import (
     EveryNFrames,
+    FilteredDerivative,
     TargetObservation,
     TimeBasedTargetFilter,
     degrees_to_position_ticks,
     position_ticks_to_degrees,
     sanitize_motion_profile,
     tracking_delta_degrees,
+    tracking_pd_delta_degrees,
     within_reacquisition_radius,
 )
 
@@ -113,6 +115,58 @@ class TrackingDeltaTests(unittest.TestCase):
     def test_invalid_detector_error_commands_no_motion(self):
         delta = tracking_delta_degrees(float("nan"), 0.006, 1, 1 / 60, 2.0)
         self.assertEqual(delta, 0.0)
+
+    def test_zero_damping_matches_proportional_controller(self):
+        proportional = tracking_delta_degrees(100, 0.003, 1, 1 / 60, 2.0)
+        damped = tracking_pd_delta_degrees(
+            100, -500, 0.003, 0.0, 1, 1 / 60, 2.0
+        )
+        self.assertAlmostEqual(damped, proportional)
+
+    def test_damping_brakes_a_closing_error(self):
+        opening = tracking_pd_delta_degrees(
+            100, 500, 0.003, 0.006, 1, 1 / 60, 2.0
+        )
+        stationary = tracking_pd_delta_degrees(
+            100, 0, 0.003, 0.006, 1, 1 / 60, 2.0
+        )
+        closing = tracking_pd_delta_degrees(
+            100, -500, 0.003, 0.006, 1, 1 / 60, 2.0
+        )
+        self.assertLess(closing, stationary)
+        self.assertLess(stationary, opening)
+
+    def test_pd_motion_retains_step_limit_and_invalid_input_guard(self):
+        limited = tracking_pd_delta_degrees(
+            1000, 10000, 0.05, 0.05, 1, 1 / 60, 0.6
+        )
+        invalid = tracking_pd_delta_degrees(
+            100, float("nan"), 0.003, 0.006, 1, 1 / 60, 0.6
+        )
+        self.assertAlmostEqual(limited, 0.6)
+        self.assertEqual(invalid, 0.0)
+
+
+class FilteredDerivativeTests(unittest.TestCase):
+    def test_first_sample_is_zero_and_following_samples_are_filtered(self):
+        derivative = FilteredDerivative(0.05, 0.25)
+        self.assertEqual(derivative.update(100.0, 1.0), 0.0)
+        rate = derivative.update(90.0, 1.02)
+        self.assertLess(rate, 0.0)
+        self.assertGreater(rate, -500.0)
+
+    def test_repeated_timestamp_holds_rate_and_long_gap_resets(self):
+        derivative = FilteredDerivative(0.0, 0.25)
+        derivative.update(100.0, 1.0)
+        self.assertAlmostEqual(derivative.update(90.0, 1.02), -500.0)
+        self.assertAlmostEqual(derivative.update(80.0, 1.02), -500.0)
+        self.assertEqual(derivative.update(70.0, 1.30), 0.0)
+
+    def test_invalid_sample_fails_closed_and_resets_history(self):
+        derivative = FilteredDerivative(0.0, 0.25)
+        derivative.update(100.0, 1.0)
+        self.assertEqual(derivative.update(float("nan"), 1.02), 0.0)
+        self.assertEqual(derivative.update(90.0, 1.04), 0.0)
 
 
 class ReacquisitionRadiusTests(unittest.TestCase):

@@ -246,6 +246,10 @@
           <input id="deg_per_px_pan" type="number" min="0.0001" max="0.05" step="0.0005" data-param="deg_per_px_pan">
           <label for="deg_per_px_tilt">Tilt degrees/pixel</label>
           <input id="deg_per_px_tilt" type="number" min="0.0001" max="0.05" step="0.0005" data-param="deg_per_px_tilt">
+          <label for="pan_damping_gain">Pan damping (D)</label>
+          <input id="pan_damping_gain" type="number" min="0" max="0.05" step="0.0005" data-param="pan_damping_gain">
+          <label for="tilt_damping_gain">Tilt damping (D)</label>
+          <input id="tilt_damping_gain" type="number" min="0" max="0.05" step="0.0005" data-param="tilt_damping_gain">
           <label for="max_step_deg">Maximum step (deg)</label>
           <input id="max_step_deg" type="number" min="0.1" max="20" step="0.1" data-param="max_step_deg">
           <label for="rate_hz">Controller rate (Hz)</label>
@@ -259,6 +263,7 @@
           <label for="tilt_dir">Tilt direction</label>
           <select id="tilt_dir" data-param="tilt_dir"><option value="-1">-1</option><option value="1">+1</option></select>
         </div>
+        <div class="hint">Damping brakes an axis as its pixel error closes. Raise it gradually; excessive damping can cause twitch or hesitation.</div>
         <div class="hint">Tracking starts disabled. Stop/torque-off remains available even if preview frames are delayed.</div>
       </details>
     </aside>

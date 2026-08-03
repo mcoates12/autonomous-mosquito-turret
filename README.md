@@ -95,6 +95,14 @@ red object. Press **Stop**, place the dot at the new location, and press
 **Start** to deliberately clear that identity and perform a fresh full-frame
 acquisition. The dashboard's `Reacquire radius` controls the allowed distance.
 
+The outer motion loop uses independent pan and tilt proportional gains plus
+filtered derivative damping. Damping is calculated from timestamped target
+error, so it does not depend on camera or controller frame rate. It resets on
+target loss, stale data, or tracking stop. The starting values are pan/tilt
+gain `0.003`, pan damping `0.006`, tilt damping `0.003`, smoothing `35 ms`, and
+maximum step `0.60 deg`. Raise damping gradually to reduce single-pass
+overshoot; excessive damping can produce twitch or hesitation.
+
 The runtime prefers the Jetson `nvv4l2camerasrc`/`nvvidconv` VIC conversion
 path and automatically falls back to the portable software pipeline if it is
 unavailable. In the preview overlay, `FPS` is the processed tracking rate and

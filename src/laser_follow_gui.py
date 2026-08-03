@@ -123,6 +123,7 @@ class Stats:
             logger.info(
                 "control hz=%.1f misses=%d io_ms(read=%.2f write=%.2f) "
                 "error_deg(pan=%.2f tilt=%.2f) "
+                "error_rate_px_s(pan=%.1f tilt=%.1f) "
                 "health(load=%.1f/%.1f%% voltage=%.1f/%.1fV temp=%d/%dC hw=0x%02x/0x%02x) "
                 "target_age=%s",
                 controller_state.controller_rate_hz,
@@ -131,6 +132,8 @@ class Stats:
                 controller_state.command_write_ms,
                 controller_state.pan_command_deg - controller_state.pan_actual_deg,
                 controller_state.tilt_command_deg - controller_state.tilt_actual_deg,
+                controller_state.pan_error_rate_px_s,
+                controller_state.tilt_error_rate_px_s,
                 controller_state.pan_load_percent,
                 controller_state.tilt_load_percent,
                 controller_state.pan_voltage,
@@ -338,7 +341,7 @@ class LiveParams:
     local_red_contrast_gate: int = 12  # red excess above nearby wall
     laser_edge_margin_px: int = 48  # ignore incomplete targets at frame edge
     area_hi_gate: float = 3000.0  # tuned bright dot may bloom substantially
-    smoothing_tau_ms: float = 60.0
+    smoothing_tau_ms: float = 35.0
     lock_time_ms: float = 50.0
     outlier_speed_px_s: float = 8000.0
     laser_roi_half_size: int = 160
@@ -360,9 +363,13 @@ class LiveParams:
     low_latency_mode: bool = True
 
     # control
-    deg_per_px_pan: float = 0.0060
+    deg_per_px_pan: float = 0.0030
     deg_per_px_tilt: float = 0.0030
-    max_step_deg: float = 0.75
+    # Outer-loop derivative damping. The filtered pixel-error rate provides
+    # braking as the target approaches center without reducing tracking gain.
+    pan_damping_gain: float = 0.0060
+    tilt_damping_gain: float = 0.0030
+    max_step_deg: float = 0.60
     deadband_px: int = 25
     rate_hz: float = 60.0
 
@@ -1950,6 +1957,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.sb_deg_pan = dbl(0.0001, 0.0500, 0.0005, p.deg_per_px_pan)
         self.sb_deg_tilt = dbl(0.0001, 0.0500, 0.0005, p.deg_per_px_tilt)
+        self.sb_pan_damping = dbl(0.0, 0.0500, 0.0005, p.pan_damping_gain)
+        self.sb_tilt_damping = dbl(0.0, 0.0500, 0.0005, p.tilt_damping_gain)
         self.sb_max_step = dbl(0.1, 20.0, 0.1, p.max_step_deg)
         self.sb_deadband = integer(0, 200, p.deadband_px)
         self.sb_rate = dbl(5.0, 120.0, 1.0, p.rate_hz)
@@ -2005,6 +2014,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         form.addRow("deg_per_px_pan", self.sb_deg_pan)
         form.addRow("deg_per_px_tilt", self.sb_deg_tilt)
+        form.addRow("pan_damping_gain", self.sb_pan_damping)
+        form.addRow("tilt_damping_gain", self.sb_tilt_damping)
         form.addRow("max_step_deg", self.sb_max_step)
         form.addRow("deadband_px", self.sb_deadband)
         form.addRow("rate_hz", self.sb_rate)
@@ -2064,6 +2075,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Live knob updates
         self.sb_deg_pan.valueChanged.connect(lambda v: self.store.set_attr("deg_per_px_pan", float(v)))
         self.sb_deg_tilt.valueChanged.connect(lambda v: self.store.set_attr("deg_per_px_tilt", float(v)))
+        self.sb_pan_damping.valueChanged.connect(
+            lambda v: self.store.set_attr("pan_damping_gain", float(v))
+        )
+        self.sb_tilt_damping.valueChanged.connect(
+            lambda v: self.store.set_attr("tilt_damping_gain", float(v))
+        )
         self.sb_max_step.valueChanged.connect(lambda v: self.store.set_attr("max_step_deg", float(v)))
         self.sb_deadband.valueChanged.connect(lambda v: self.store.set_attr("deadband_px", int(v)))
         self.sb_rate.valueChanged.connect(lambda v: self.store.set_attr("rate_hz", float(v)))
@@ -2138,6 +2155,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_tooltips(self):
         self.sb_deg_pan.setToolTip("Degrees moved per pixel of horizontal error. Higher = faster/more aggressive, but can overshoot/jitter.")
         self.sb_deg_tilt.setToolTip("Degrees moved per pixel of vertical error. Higher = faster/more aggressive, but can overshoot/jitter.")
+        self.sb_pan_damping.setToolTip(
+            "Filtered derivative damping for pan. Raise gradually to brake "
+            "horizontal overshoot; too high can add twitch or hesitation."
+        )
+        self.sb_tilt_damping.setToolTip(
+            "Filtered derivative damping for tilt. Raise gradually to brake "
+            "vertical overshoot; too high can add twitch or hesitation."
+        )
         self.sb_max_step.setToolTip("Maximum command change at the 60 Hz reference rate. It is time-scaled when rate_hz changes. Lower = smoother/safer.")
         self.sb_deadband.setToolTip("If error magnitude is below this many pixels, treat it as zero (no movement). Bigger = less jitter near center.")
         self.sb_rate.setToolTip("Fixed servo controller rate in Hz. It is independent of camera and detector FPS; 60 Hz is the recommended starting point.")
