@@ -73,17 +73,13 @@ Port**, enter `8080`, then open the forwarded address in the PC browser.
 Alternatively, keep this command running in a Windows PowerShell window:
 
 ```powershell
-ssh -N -L 8080:127.0.0.1:8080 myles@192.168.1.141
+ssh -N -L 8080:127.0.0.1:8080 YOUR_USERNAME@JETSON_IP
 ```
 
-PowerShell showing no prompt or output means the tunnel is working. Open
+Replace `YOUR_USERNAME` and `JETSON_IP` with your own Jetson connection details.
+Keep the PowerShell window open while using the dashboard. Open
 <http://127.0.0.1:8080> in the PC browser. The dashboard automatically disables
 tracking if its heartbeat disappears for five seconds.
-
-For a trusted private LAN only, the dashboard can be exposed directly with
-`python3 src/laser_follow_web.py --bind 0.0.0.0`, then opened at
-`http://JETSON_IP:8080`. This mode has no authentication, so the SSH/VS Code
-forward is preferred.
 
 The diagnostic stream defaults to 10 FPS at 960 pixels wide and does not set
 the camera capture rate. On a heavily loaded Jetson, reduce dashboard overhead
